@@ -1,3 +1,6 @@
-# DM Linker Web v5.1 – no fallback, no search strings
+# DM Linker Web v6 – auto lookup, no fallback
 
-Ingen fallback/search skapas. Om artikel saknas i data/master_mapping.csv blir det ingen länk och visas på resultatsidan.
+- Först används data/master_mapping.csv.
+- Saknas artikel där försöker appen live-lookup på Jula via artikelnummer.
+- Hittas ingen säker produktsida skapas ingen länk alls.
+- Search/fallback-länk skapas aldrig.

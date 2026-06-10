@@ -4,16 +4,33 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import urljoin
 
 import fitz  # PyMuPDF
+import requests
 from flask import Flask, request, send_file, flash, redirect, url_for, render_template_string, abort
 
 app = Flask(__name__)
-app.secret_key = "dm-linker-web-v5-1-secret"
+app.secret_key = "dm-linker-web-v6-secret"
 
 ARTICLE_RE = re.compile(r"\b\d{6}\b")
 OUTPUTS = {}
+LOOKUP_CACHE = {}
 MASTER_MAPPING_FILE = Path(__file__).parent / "data" / "master_mapping.csv"
+
+COUNTRY_BASE = {
+    "SE": "https://www.jula.se",
+    "NO": "https://www.jula.no",
+    "FI": "https://www.jula.fi",
+    "PL": "https://www.jula.pl",
+}
+
+SEARCH_URLS = {
+    "SE": "https://www.jula.se/search/?query={article}",
+    "NO": "https://www.jula.no/search/?query={article}",
+    "FI": "https://www.jula.fi/search/?query={article}",
+    "PL": "https://www.jula.pl/search/?query={article}",
+}
 
 HTML_INDEX = """
 <!doctype html>
@@ -89,12 +106,14 @@ HTML_RESULT = """
     <div class="ok">
       PDF skapad. Länkar infogade: <strong>{{ inserted }}</strong>.<br>
       Hittade artiklar: <strong>{{ total_articles }}</strong>.<br>
-      Artiklar utan URL i master-mapping: <strong>{{ missing|length }}</strong>.
+      Hittade via intern mapping: <strong>{{ mapped_count }}</strong>.<br>
+      Hittade via automatisk lookup: <strong>{{ looked_up_count }}</strong>.<br>
+      Artiklar utan säker produktsida: <strong>{{ missing|length }}</strong>.
     </div>
     {% if missing %}
       <div class="warn">
         <strong>Vissa produkter fick ingen länk.</strong><br>
-        Orsak: artikelnumret saknas i <code>data/master_mapping.csv</code> för valt land. Ingen fallback/search-länk har skapats.
+        Orsak: appen hittade ingen säker produktsida för artikelnumret. Ingen fallback/search-länk har skapats.
       </div>
       <h3>Saknade artikelnummer</h3>
       <ul>{% for article in missing %}<li><code>{{ article }}</code></li>{% endfor %}</ul>
@@ -105,6 +124,7 @@ HTML_RESULT = """
 </body>
 </html>
 """
+
 
 def load_master_mapping():
     mapping = {}
@@ -126,10 +146,71 @@ def first_article(text: str):
     return m.group(0) if m else None
 
 
+def is_product_url(url: str, article: str, country: str) -> bool:
+    if not url:
+        return False
+    base = COUNTRY_BASE[country]
+    return url.startswith(base) and "/catalog/" in url and article in url and "search" not in url.lower()
+
+
+def extract_product_url_from_html(html: str, article: str, country: str):
+    base = COUNTRY_BASE[country]
+    # Look for any /catalog/...article.../ URL in href, canonical, og:url etc.
+    candidates = re.findall(r'(?:href|content)=["\']([^"\']*?/catalog/[^"\']*?' + re.escape(article) + r'[^"\']*?)["\']', html, flags=re.I)
+    for c in candidates:
+        full = urljoin(base, c)
+        full = full.split('?')[0].split('#')[0]
+        if is_product_url(full, article, country):
+            return full
+    # Fallback regex over raw html if attributes are minified/encoded
+    candidates = re.findall(r'https?://www\.jula\.(?:se|no|fi|pl)/catalog/[^\s"\']*?' + re.escape(article) + r'[^\s"\']*', html, flags=re.I)
+    for c in candidates:
+        full = c.split('?')[0].split('#')[0]
+        if is_product_url(full, article, country):
+            return full
+    return None
+
+
+def lookup_product_url(country: str, article: str):
+    cache_key = (country, article)
+    if cache_key in LOOKUP_CACHE:
+        return LOOKUP_CACHE[cache_key]
+
+    search_url = SEARCH_URLS[country].format(article=article)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; DM-Linker/1.0)",
+        "Accept-Language": "sv,en;q=0.8",
+    }
+    try:
+        r = requests.get(search_url, headers=headers, timeout=12, allow_redirects=True)
+        final_url = r.url.split('?')[0].split('#')[0]
+        if is_product_url(final_url, article, country):
+            LOOKUP_CACHE[cache_key] = final_url
+            return final_url
+        url = extract_product_url_from_html(r.text, article, country)
+        LOOKUP_CACHE[cache_key] = url
+        return url
+    except Exception:
+        LOOKUP_CACHE[cache_key] = None
+        return None
+
+
+def resolve_url(country: str, article: str, master: dict):
+    mapped = master.get((country, article))
+    if mapped:
+        return mapped, "mapping"
+    looked_up = lookup_product_url(country, article)
+    if looked_up:
+        return looked_up, "lookup"
+    return None, "missing"
+
+
 def link_pdf(input_path: Path, country: str):
     master = load_master_mapping()
     doc = fitz.open(input_path)
     inserted = 0
+    mapped_count = 0
+    looked_up_count = 0
     found_articles = []
     missing = set()
 
@@ -145,12 +226,17 @@ def link_pdf(input_path: Path, country: str):
                 continue
 
             found_articles.append(article)
-            url = master.get((country, article))
+            url, source = resolve_url(country, article, master)
 
-            # Ingen fallback. Om riktig URL saknas skapas ingen länk alls.
+            # Viktigt: ingen search/fallback. Om ingen säker produkt-URL hittas blir det ingen länk.
             if not url:
                 missing.add(article)
                 continue
+
+            if source == "mapping":
+                mapped_count += 1
+            elif source == "lookup":
+                looked_up_count += 1
 
             page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url, "border": [0, 0, 0]})
             inserted += 1
@@ -159,7 +245,7 @@ def link_pdf(input_path: Path, country: str):
     out_file = out_dir / f"linked_{input_path.name}"
     doc.save(out_file)
     doc.close()
-    return out_file, inserted, found_articles, sorted(missing)
+    return out_file, inserted, found_articles, sorted(missing), mapped_count, looked_up_count
 
 
 @app.get('/')
@@ -183,14 +269,22 @@ def link_route():
     in_path = temp_dir / pdf.filename
     pdf.save(in_path)
 
-    out_path, inserted, found_articles, missing = link_pdf(in_path, country)
+    out_path, inserted, found_articles, missing, mapped_count, looked_up_count = link_pdf(in_path, country)
     if not found_articles:
         flash('Inga artikelnummer hittades i PDF:ens textlager.')
         return redirect(url_for('index'))
 
     file_id = str(uuid.uuid4())
     OUTPUTS[file_id] = out_path
-    return render_template_string(HTML_RESULT, inserted=inserted, total_articles=len(found_articles), missing=missing, file_id=file_id)
+    return render_template_string(
+        HTML_RESULT,
+        inserted=inserted,
+        total_articles=len(found_articles),
+        missing=missing,
+        file_id=file_id,
+        mapped_count=mapped_count,
+        looked_up_count=looked_up_count,
+    )
 
 
 @app.get('/download/<file_id>')
