@@ -9,11 +9,10 @@ import fitz  # PyMuPDF
 from flask import Flask, request, send_file, flash, redirect, url_for, render_template_string, abort
 
 app = Flask(__name__)
-app.secret_key = "dm-linker-web-v5-secret"
+app.secret_key = "dm-linker-web-v5-1-secret"
 
 ARTICLE_RE = re.compile(r"\b\d{6}\b")
 OUTPUTS = {}
-
 MASTER_MAPPING_FILE = Path(__file__).parent / "data" / "master_mapping.csv"
 
 HTML_INDEX = """
@@ -39,19 +38,14 @@ HTML_INDEX = """
   <div class="card">
     <h1>DM Linker</h1>
     <p class="muted">Ladda upp PDF, välj land och få tillbaka en länkad PDF.</p>
-
     {% with messages = get_flashed_messages() %}
       {% if messages %}
-        {% for msg in messages %}
-          <div class="flash">{{ msg }}</div>
-        {% endfor %}
+        {% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}
       {% endif %}
     {% endwith %}
-
     <form method="post" enctype="multipart/form-data" action="/link">
       <label>PDF</label>
       <input type="file" name="pdf" accept=".pdf" required>
-
       <div class="row">
         <div>
           <label>Land</label>
@@ -63,7 +57,6 @@ HTML_INDEX = """
           </select>
         </div>
       </div>
-
       <button type="submit">Länka PDF</button>
     </form>
   </div>
@@ -93,33 +86,25 @@ HTML_RESULT = """
 <body>
   <div class="card">
     <h1>Resultat</h1>
-
     <div class="ok">
       PDF skapad. Länkar infogade: <strong>{{ inserted }}</strong>.<br>
       Hittade artiklar: <strong>{{ total_articles }}</strong>.<br>
       Artiklar utan URL i master-mapping: <strong>{{ missing|length }}</strong>.
     </div>
-
     {% if missing %}
       <div class="warn">
         <strong>Vissa produkter fick ingen länk.</strong><br>
         Orsak: artikelnumret saknas i <code>data/master_mapping.csv</code> för valt land. Ingen fallback/search-länk har skapats.
       </div>
       <h3>Saknade artikelnummer</h3>
-      <ul>
-        {% for article in missing %}
-          <li><code>{{ article }}</code></li>
-        {% endfor %}
-      </ul>
+      <ul>{% for article in missing %}<li><code>{{ article }}</code></li>{% endfor %}</ul>
     {% endif %}
-
     <a class="button" href="/download/{{ file_id }}">Ladda ner PDF</a>
     <a class="button secondary" href="/">Länka en ny PDF</a>
   </div>
 </body>
 </html>
 """
-
 
 def load_master_mapping():
     mapping = {}
@@ -162,17 +147,12 @@ def link_pdf(input_path: Path, country: str):
             found_articles.append(article)
             url = master.get((country, article))
 
-            # VIKTIGT: Ingen fallback. Om URL saknas skapas ingen länk alls.
+            # Ingen fallback. Om riktig URL saknas skapas ingen länk alls.
             if not url:
                 missing.add(article)
                 continue
 
-            page.insert_link({
-                "kind": fitz.LINK_URI,
-                "from": rect,
-                "uri": url,
-                "border": [0, 0, 0],
-            })
+            page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url, "border": [0, 0, 0]})
             inserted += 1
 
     out_dir = Path(tempfile.mkdtemp())
@@ -210,14 +190,7 @@ def link_route():
 
     file_id = str(uuid.uuid4())
     OUTPUTS[file_id] = out_path
-
-    return render_template_string(
-        HTML_RESULT,
-        inserted=inserted,
-        total_articles=len(found_articles),
-        missing=missing,
-        file_id=file_id,
-    )
+    return render_template_string(HTML_RESULT, inserted=inserted, total_articles=len(found_articles), missing=missing, file_id=file_id)
 
 
 @app.get('/download/<file_id>')
