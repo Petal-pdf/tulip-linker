@@ -1,25 +1,26 @@
 
-# DM Linker Web v3
+# DM Linker Web v5 – no fallback
 
-## Varför den förra versionen såg trasig ut
-Om Jinja-kod som `{% with ... %}` syns i webbläsaren är HTML-sidan inte renderad av Flask.
-Det betyder att sidan hostades statiskt eller öppnades fel.
+## Ändring i v5
+- Inga fallback/search-länkar skapas längre.
+- Om artikelnummer saknas i `data/master_mapping.csv` blir det **ingen länk alls**.
+- Resultatsidan visar vilka artikelnummer som saknar URL.
 
-## Den här versionen fixar det
-- HTML renderas direkt från `render_template_string()` i Flask
-- uppladdningsformuläret postar till `/link`
-- filen skickas tillbaka som nedladdning från backend
+## UI
+Visar bara:
+- PDF
+- Land
+- Länka PDF
 
-## Deploy
-### Render / Railway / Azure App Service
-- Build command: `pip install -r requirements.txt`
-- Start command: `gunicorn app:app`
+## Master mapping
+Fyll på `data/master_mapping.csv` så här:
 
-### Docker
-```bash
-docker build -t dm-linker-web-v3 .
-docker run -p 8000:8000 dm-linker-web-v3
+```csv
+country,article,url
+PL,000815,https://www.jula.pl/catalog/.../kempingowe-krzeslo-000815/
+SE,000815,https://www.jula.se/catalog/.../campingstol-000815/
 ```
 
-## Hälso-check
-GET `/health` ska returnera `{"ok": true}`.
+## Deploy på Render
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `gunicorn app:app`
