@@ -1,4 +1,5 @@
 
+import json
 import re
 import tempfile
 import uuid
@@ -12,11 +13,11 @@ from flask import Flask, request, send_file, flash, redirect, url_for, render_te
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 app = Flask(__name__)
-app.secret_key = "dm-linker-v10-2-job-status"
+app.secret_key = "dm-linker-v10-3-persistent-download"
 
 ARTICLE_RE = re.compile(r"\b\d{6}\b")
-OUTPUTS = {}
-JOBS = {}
+JOBS_ROOT = Path(tempfile.gettempdir()) / "dm_linker_jobs"
+JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 
 COUNTRY_BASE = {
     "SE": "https://www.jula.se",
@@ -38,7 +39,7 @@ HTML_INDEX = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DM Linker V10.2</title>
+  <title>DM Linker V10.3</title>
   <style>
     body { font-family: Segoe UI, Arial, sans-serif; max-width: 920px; margin: 40px auto; padding: 0 16px; color: #222; background:#fafafa; }
     .card { background:white; border: 1px solid #ddd; border-radius: 14px; padding: 24px; box-shadow: 0 2px 10px rgba(0,0,0,.05); }
@@ -53,8 +54,8 @@ HTML_INDEX = """
 </head>
 <body>
   <div class="card">
-    <h1>DM Linker V10.2</h1>
-    <p class="muted">Jobbsida: appen startar länkningen i bakgrunden och visar status tills PDF:en är klar. Ingen search/fallback skapas i PDF:en.</p>
+    <h1>DM Linker V10.3</h1>
+    <p class="muted">Jobbsida med stabilare download. Ingen search/fallback skapas i PDF:en.</p>
     {% with messages = get_flashed_messages() %}
       {% if messages %}{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}{% endif %}
     {% endwith %}
@@ -77,7 +78,7 @@ HTML_STATUS = """
 <html lang="sv">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="4">
+  {% if job.status not in ['done','error','expired'] %}<meta http-equiv="refresh" content="4">{% endif %}
   <title>DM Linker – jobstatus</title>
   <style>
     body { font-family: Segoe UI, Arial, sans-serif; max-width: 920px; margin: 40px auto; padding: 0 16px; color: #222; background:#fafafa; }
@@ -110,11 +111,41 @@ HTML_STATUS = """
   {% elif job.status == 'error' %}
     <div class="error">{{ job.error }}</div>
     <a class="button secondary" href="/">Tillbaka</a>
+  {% elif job.status == 'expired' %}
+    <div class="warn">Jobbet finns inte längre. Detta händer oftast om Render startade om tjänsten efter att PDF:en skapades. Kör PDF:en igen och ladda ner från den nya statussidan.</div>
+    <a class="button secondary" href="/">Starta om</a>
   {% else %}
     <div class="warn">Jobbet körs. Sidan uppdateras automatiskt var fjärde sekund. Lämna fliken öppen.</div>
   {% endif %}
 </div></body></html>
 """
+
+def job_dir(job_id: str) -> Path:
+    return JOBS_ROOT / job_id
+
+
+def job_json_path(job_id: str) -> Path:
+    return job_dir(job_id) / "job.json"
+
+
+def save_job(job_id: str, job: dict):
+    d = job_dir(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+    job_json_path(job_id).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_job(job_id: str) -> dict:
+    p = job_json_path(job_id)
+    if not p.exists():
+        return {"status": "expired", "message": "Jobbet hittades inte.", "country": "", "total_articles": 0, "inserted": 0, "missing": [], "output": None, "error": ""}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def update_job(job_id: str, **kwargs):
+    job = load_job(job_id)
+    job.update(kwargs)
+    save_job(job_id, job)
+
 
 def first_article(text: str):
     m = ARTICLE_RE.search(text or "")
@@ -129,7 +160,7 @@ def is_valid_product_url(url: str, country: str, article: str) -> bool:
     return clean.startswith(base) and "/catalog/" in clean and article in clean and "search" not in clean.lower()
 
 
-def browser_lookup_urls(country: str, articles: list[str], job: dict) -> dict:
+def browser_lookup_urls(country: str, articles: list[str], job_id: str) -> dict:
     base = COUNTRY_BASE[country]
     results = {a: None for a in articles}
 
@@ -141,12 +172,10 @@ def browser_lookup_urls(country: str, articles: list[str], job: dict) -> dict:
             viewport={"width": 1366, "height": 900},
         )
         page = context.new_page()
-
         for idx, article in enumerate(articles, start=1):
-            job["message"] = f"Slår upp artikel {idx}/{len(articles)}: {article}"
+            update_job(job_id, message=f"Slår upp artikel {idx}/{len(articles)}: {article}")
             search_url = SEARCH_URLS[country].format(article=article)
             try:
-                # domcontentloaded är lättare än networkidle och minskar 502-risk.
                 page.goto(search_url, wait_until="domcontentloaded", timeout=12000)
                 page.wait_for_timeout(1500)
             except PlaywrightTimeoutError:
@@ -170,7 +199,6 @@ def browser_lookup_urls(country: str, articles: list[str], job: dict) -> dict:
             except Exception:
                 hrefs = []
 
-            # Strict: produkt-URL måste innehålla artikelnummer.
             for href in hrefs:
                 clean = href.split("?")[0].split("#")[0]
                 if is_valid_product_url(clean, country, article):
@@ -180,7 +208,6 @@ def browser_lookup_urls(country: str, articles: list[str], job: dict) -> dict:
             if results[article]:
                 continue
 
-            # Lättare fallback: öppna bara första 3 kandidater, inte 8.
             for href in hrefs[:3]:
                 clean = href.split("?")[0].split("#")[0]
                 if not clean.startswith(base) or "/catalog/" not in clean or "search" in clean.lower():
@@ -207,10 +234,8 @@ def browser_lookup_urls(country: str, articles: list[str], job: dict) -> dict:
 
 
 def run_job(job_id: str, input_path: str, country: str):
-    job = JOBS[job_id]
     try:
-        job["status"] = "running"
-        job["message"] = "Läser PDF och hittar artikelnummer..."
+        update_job(job_id, status="running", message="Läser PDF och hittar artikelnummer...")
         path = Path(input_path)
         doc = fitz.open(path)
         blocks_info = []
@@ -226,18 +251,17 @@ def run_job(job_id: str, input_path: str, country: str):
                     if article not in articles:
                         articles.append(article)
 
-        job["total_articles"] = len(articles)
+        update_job(job_id, total_articles=len(articles))
         if not articles:
-            job["status"] = "done"
-            job["message"] = "Inga artikelnummer hittades."
+            update_job(job_id, status="done", message="Inga artikelnummer hittades.")
             return
 
-        job["message"] = "Startar browser-lookup..."
-        lookup = browser_lookup_urls(country, articles, job)
+        update_job(job_id, message="Startar browser-lookup...")
+        lookup = browser_lookup_urls(country, articles, job_id)
 
         inserted = 0
         missing = set()
-        job["message"] = "Skriver länkar i PDF..."
+        update_job(job_id, message="Skriver länkar i PDF...")
         for page_index, block, article in blocks_info:
             url = lookup.get(article)
             if not url:
@@ -247,20 +271,13 @@ def run_job(job_id: str, input_path: str, country: str):
             doc[page_index].insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url, "border": [0, 0, 0]})
             inserted += 1
 
-        out_dir = Path(tempfile.mkdtemp())
-        out_file = out_dir / f"linked_{path.name}"
+        out_file = job_dir(job_id) / f"linked_{path.name}"
         doc.save(out_file)
         doc.close()
 
-        job["output"] = str(out_file)
-        job["inserted"] = inserted
-        job["missing"] = sorted(missing)
-        job["status"] = "done"
-        job["message"] = "Klart."
+        update_job(job_id, output=str(out_file), inserted=inserted, missing=sorted(missing), status="done", message="Klart.")
     except Exception:
-        job["status"] = "error"
-        job["error"] = traceback.format_exc()
-        job["message"] = "Jobbet misslyckades. Se felmeddelande nedan."
+        update_job(job_id, status="error", error=traceback.format_exc(), message="Jobbet misslyckades. Se felmeddelande nedan.")
 
 
 @app.get('/')
@@ -280,12 +297,13 @@ def link_route():
         flash('Filen måste vara en PDF.')
         return redirect(url_for('index'))
 
-    temp_dir = Path(tempfile.mkdtemp())
-    in_path = temp_dir / pdf.filename
+    job_id = str(uuid.uuid4())
+    d = job_dir(job_id)
+    d.mkdir(parents=True, exist_ok=True)
+    in_path = d / pdf.filename
     pdf.save(in_path)
 
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {
+    save_job(job_id, {
         "status": "queued",
         "message": "Jobbet är köat...",
         "country": country,
@@ -294,7 +312,7 @@ def link_route():
         "missing": [],
         "output": None,
         "error": "",
-    }
+    })
     thread = threading.Thread(target=run_job, args=(job_id, str(in_path), country), daemon=True)
     thread.start()
     return redirect(url_for('status', job_id=job_id))
@@ -302,18 +320,17 @@ def link_route():
 
 @app.get('/status/<job_id>')
 def status(job_id):
-    job = JOBS.get(job_id)
-    if not job:
-        abort(404)
+    job = load_job(job_id)
     return render_template_string(HTML_STATUS, job=job, job_id=job_id)
 
 
 @app.get('/download/<job_id>')
 def download(job_id):
-    job = JOBS.get(job_id)
-    if not job or job.get("status") != "done" or not job.get("output"):
+    job = load_job(job_id)
+    output = job.get("output")
+    if job.get("status") != "done" or not output:
         abort(404)
-    path = Path(job["output"])
+    path = Path(output)
     if not path.exists():
         abort(404)
     return send_file(path, as_attachment=True, download_name=path.name, mimetype='application/pdf')
@@ -321,7 +338,7 @@ def download(job_id):
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'version': 'v10.2-job-status'}
+    return {'ok': True, 'version': 'v10.3-persistent-download'}
 
 
 if __name__ == '__main__':
