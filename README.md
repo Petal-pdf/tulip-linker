@@ -1,6 +1,18 @@
-# DM Linker Web v6 – auto lookup, no fallback
 
-- Först används data/master_mapping.csv.
-- Saknas artikel där försöker appen live-lookup på Jula via artikelnummer.
-- Hittas ingen säker produktsida skapas ingen länk alls.
-- Search/fallback-länk skapas aldrig.
+# DM Linker Web V10 – Browser Lookup
+
+Denna version använder Playwright/Chromium för att slå upp produkter som en riktig browser.
+
+## Viktigt på Render
+Använd Docker runtime eller låt Render bygga med Dockerfile.
+Den här appen behöver Chromium, därför används Playwright Docker image.
+
+## Render
+- Environment: Docker om möjligt
+- Dockerfile finns i repo
+- Start sker via Dockerfile CMD
+
+## Beteende
+- Hittar riktig produktsida => länk skapas
+- Hittar ingen säker produktsida => ingen länk
+- Ingen search/fallback-länk skapas i PDF:en
