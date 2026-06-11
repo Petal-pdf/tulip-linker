@@ -1,20 +1,21 @@
 
 import re
+import json
 import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import fitz
 import requests
-from flask import Flask, request, send_file, flash, redirect, url_for, render_template_string, abort
+from flask import Flask, request, send_file, redirect
 
 app = Flask(__name__)
-app.secret_key = "dm-linker-v9"
 
 ARTICLE_RE = re.compile(r"\b\d{6}\b")
 OUTPUTS = {}
+CACHE_PATH = Path("data/cache.json")
 
 COUNTRY_BASE = {
     "SE": "https://www.jula.se",
@@ -23,136 +24,110 @@ COUNTRY_BASE = {
     "PL": "https://www.jula.pl",
 }
 
-SEARCH_URLS = {
-    "SE": "https://www.jula.se/search/?query={article}",
-    "NO": "https://www.jula.no/search/?query={article}",
-    "FI": "https://www.jula.fi/search/?query={article}",
-    "PL": "https://www.jula.pl/search/?query={article}",
+SEARCH_URL = {
+    "SE": "https://www.jula.se/search/?query={}",
+    "NO": "https://www.jula.no/search/?query={}",
+    "FI": "https://www.jula.fi/search/?query={}",
+    "PL": "https://www.jula.pl/search/?query={}",
 }
 
-HTML = """
-<!doctype html>
-<html><body>
-<h2>DM Linker v9</h2>
-<form method=post enctype=multipart/form-data action="/link">
-PDF: <input type=file name=pdf><br>
-Land:
-<select name=country>
-<option>SE</option><option>NO</option><option>FI</option><option>PL</option>
-</select>
-<br><button type=submit>Länka PDF</button>
-</form>
-</body></html>
-"""
+# ---------- CACHE ----------
+def load_cache():
+    if CACHE_PATH.exists():
+        return json.loads(CACHE_PATH.read_text())
+    return {}
 
 
-def extract_article(text):
-    m = ARTICLE_RE.search(text or "")
-    return m.group(0) if m else None
+def save_cache(c):
+    CACHE_PATH.write_text(json.dumps(c, indent=2))
 
 
-def fast_lookup(country, article):
-    base = COUNTRY_BASE[country]
-    url = SEARCH_URLS[country].format(article=article)
+# ---------- LOOKUP ----------
+def lookup(country, article, cache):
+    key = f"{country}_{article}"
+
+    if key in cache:
+        return cache[key]
 
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        links = re.findall(r'href="([^"]*?/catalog/[^"]+)"', r.text, re.I)
+        r = requests.get(SEARCH_URL[country].format(article), timeout=8)
+        matches = re.findall(r'href="(/catalog/[^"]+)"', r.text)
 
-        for link in links[:5]:  # top 5 candidates
-            full = urljoin(base, link).split("?")[0]
-            if "search" in full: continue
+        for m in matches:
+            url = urljoin(COUNTRY_BASE[country], m)
+            if article in url and "search" not in url:
+                cache[key] = url
+                return url
 
-            try:
-                pr = requests.get(full, timeout=6)
-                if article in pr.text:
-                    return full
-            except:
-                continue
     except:
-        return None
+        pass
 
     return None
 
 
-def resolve_bulk(country, articles):
-    results = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(fast_lookup, country, a): a for a in articles}
+# ---------- PDF ----------
+def process(pdf, country):
+    doc = fitz.open(pdf)
+    cache = load_cache()
 
-        for f in as_completed(futures):
-            art = futures[f]
-            try:
-                results[art] = f.result()
-            except:
-                results[art] = None
+    articles = []
+    blocks = []
 
-    return results
+    for i, page in enumerate(doc):
+        for b in page.get_text("blocks"):
+            text = b[4]
+            m = ARTICLE_RE.search(text or "")
+            if m:
+                article = m.group(0)
+                articles.append(article)
+                blocks.append((i, b, article))
 
+    def worker(a):
+        return a, lookup(country, a, cache)
 
-def link_pdf(path, country):
-    doc = fitz.open(path)
-
-    articles = set()
-    blocks_info = []
-
-    for page_index, page in enumerate(doc):
-        for block in page.get_text("blocks"):
-            art = extract_article(block[4])
-            if art:
-                articles.add(art)
-                blocks_info.append((page_index, block, art))
-
-    lookup = resolve_bulk(country, list(articles))
+    results = dict(ThreadPoolExecutor(max_workers=6).map(worker, set(articles)))
 
     inserted = 0
     missing = []
 
-    for page_index, block, art in blocks_info:
-        page = doc[page_index]
-        rect = fitz.Rect(block[:4])
-
-        url = lookup.get(art)
+    for i, b, art in blocks:
+        rect = fitz.Rect(b[:4])
+        url = results.get(art)
 
         if not url:
             missing.append(art)
             continue
 
-        page.insert_link({
-            "kind": fitz.LINK_URI,
-            "from": rect,
-            "uri": url
-        })
+        doc[i].insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url})
         inserted += 1
 
-    out = Path(tempfile.mkdtemp()) / f"linked_{path.name}"
+    out = Path(tempfile.mkdtemp()) / f"linked_{Path(pdf).name}"
     doc.save(out)
-    return out, inserted, len(articles), missing
+    save_cache(cache)
+
+    return out, inserted, len(set(articles)), missing
 
 
+# ---------- ROUTES ----------
 @app.route("/")
 def index():
-    return HTML
+    return "<form method=post enctype=multipart/form-data action='/link'>PDF:<input type=file name=pdf><select name=country><option>SE</option><option>NO</option><option>FI</option><option>PL</option></select><button>Länk</button></form>"
 
 
 @app.route("/link", methods=["POST"])
 def link():
-    file = request.files.get("pdf")
+    f = request.files["pdf"]
     country = request.form.get("country", "SE")
 
-    if not file:
-        flash("No file")
-        return redirect("/")
+    temp = Path(tempfile.mkdtemp()) / f.filename
+    f.save(temp)
 
-    tmp = Path(tempfile.mkdtemp()) / file.filename
-    file.save(tmp)
-
-    out, inserted, total, missing = link_pdf(tmp, country)
+    out, ins, total, miss = process(temp, country)
 
     fid = str(uuid.uuid4())
     OUTPUTS[fid] = out
 
-    return f"Inserted: {inserted}/{total}<br>Missing: {len(missing)}<br><a href='/download/{fid}'>Download</a>"
+    return f"Inserted {ins}/{total}<br>Missing {len(miss)}<br><a href='/download/{fid}'>Download</a>"
 
 
 @app.route("/download/<fid>")
@@ -161,5 +136,4 @@ def download(fid):
 
 
 if __name__ == "__main__":
-    import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=8000)
