@@ -2,9 +2,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote_plus
 
-import fitz  # PyMuPDF
-import cv2
-import numpy as np
+import fitz
 from flask import Flask, request, send_file
 
 app = Flask(__name__)
@@ -24,106 +22,76 @@ def lookup(article):
 
 
 # -------------------------
-# PDF → bild
+# ✅ SMART PRODUKT-RUTA (FUNKAR PÅ DIN LAYOUT)
 # -------------------------
-def page_to_image(page):
-    pix = page.get_pixmap()
-    img = np.frombuffer(pix.samples, dtype=np.uint8)
-    img = img.reshape(pix.height, pix.width, pix.n)
-    return img
-
-
-# -------------------------
-# ✅ BÄTTRE AI: hittar riktiga produktytor
-# -------------------------
-def detect_boxes(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # blur = mindre brus
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # threshold = hitta stora ljusa/mörka ytor
-    _, thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
-
-    # slå ihop områden (det här är magic)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    merged = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-    # hitta shapes
-    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-
-        area = w * h
-
-        # 🔥 filtrera små saker
-        if area > 50000:
-            boxes.append((x, y, w, h))
-
-    return boxes
-
-
-# -------------------------
-# matcha artikel → närmaste ruta
-# -------------------------
-def match_articles(page, boxes):
+def find_product_rect(page, article):
     words = page.get_text("words")
-    results = {}
 
+    anchors = [w for w in words if w[4] == article]
+    if not anchors:
+        return None
+
+    ax0, ay0, ax1, ay1 = anchors[0][:4]
+
+    rects = []
+
+    # 🔥 samla text nära artikeln (produkt område)
     for w in words:
-        text = w[4]
+        x0, y0, x1, y1 = w[:4]
 
-        if re.fullmatch(r"\d{6,7}", text):
-            ax, ay = w[0], w[1]
+        if (
+            abs(x0 - ax0) < 250 and   # samma kolumn
+            y0 > ay0 - 320 and        # upp (bild)
+            y0 < ay0 + 150            # ner (text)
+        ):
+            rects.append(fitz.Rect(x0, y0, x1, y1))
 
-            best = None
-            best_dist = 999999
+    if not rects:
+        return None
 
-            for (x, y, bw, bh) in boxes:
-                cx = x + bw / 2
-                cy = y + bh / 2
+    rect = rects[0]
+    for r in rects[1:]:
+        rect |= r
 
-                dist = abs(ax - cx) + abs(ay - cy)
+    # 🔥 expandera till hela produktkortet
+    rect = fitz.Rect(
+        rect.x0 - 140,
+        rect.y0 - 260,
+        rect.x1 + 140,
+        rect.y1 + 100,
+    )
 
-                if dist < best_dist:
-                    best_dist = dist
-                    best = (x, y, bw, bh)
+    # håll inom sidan
+    rect = fitz.Rect(
+        max(0, rect.x0),
+        max(0, rect.y0),
+        min(page.rect.width, rect.x1),
+        min(page.rect.height, rect.y1),
+    )
 
-            if best:
-                results[text] = best
-
-    return results
+    return rect
 
 
 # -------------------------
-# processera PDF
+# PROCESS
 # -------------------------
 def process_pdf(input_path, output_path):
     doc = fitz.open(input_path)
 
     for page in doc:
-        img = page_to_image(page)
-        boxes = detect_boxes(img)
+        for block in page.get_text("blocks"):
+            articles = find_articles(block[4])
 
-        article_boxes = match_articles(page, boxes)
+            for article in articles:
+                rect = find_product_rect(page, article)
+                if not rect:
+                    continue
 
-        for article, (x, y, w, h) in article_boxes.items():
-
-            # ✅ lite padding så hela rutan täcks
-            rect = fitz.Rect(
-                x - 20,
-                y - 20,
-                x + w + 20,
-                y + h + 20
-            )
-
-            page.insert_link({
-                "kind": fitz.LINK_URI,
-                "from": rect,
-                "uri": lookup(article)
-            })
+                page.insert_link({
+                    "kind": fitz.LINK_URI,
+                    "from": rect,
+                    "uri": lookup(article)
+                })
 
     doc.save(output_path)
     doc.close()
@@ -135,7 +103,7 @@ def process_pdf(input_path, output_path):
 @app.route("/")
 def index():
     return """
-    <h2>DM Linker AI</h2>
+    <h2>DM Linker</h2>
     <form action="/link" method="post" enctype="multipart/form-data">
         <input type="file" name="pdf" required>
         <button type="submit">Start</button>
@@ -160,4 +128,3 @@ def link():
 # -------------------------
 if __name__ == "__main__":
     app.run()
-``
