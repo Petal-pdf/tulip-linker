@@ -34,28 +34,39 @@ def page_to_image(page):
 
 
 # -------------------------
-# AI: hitta boxar
+# ✅ BÄTTRE AI: hittar riktiga produktytor
 # -------------------------
 def detect_boxes(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    edges = cv2.Canny(gray, 50, 150)
+    # blur = mindre brus
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # threshold = hitta stora ljusa/mörka ytor
+    _, thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # slå ihop områden (det här är magic)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    merged = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    # hitta shapes
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     boxes = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
 
-        # filtrera små saker
-        if w > 200 and h > 200:
+        area = w * h
+
+        # 🔥 filtrera små saker
+        if area > 50000:
             boxes.append((x, y, w, h))
 
     return boxes
 
 
 # -------------------------
-# Match artikel → box
+# matcha artikel → närmaste ruta
 # -------------------------
 def match_articles(page, boxes):
     words = page.get_text("words")
@@ -87,7 +98,7 @@ def match_articles(page, boxes):
 
 
 # -------------------------
-# PROCESS
+# processera PDF
 # -------------------------
 def process_pdf(input_path, output_path):
     doc = fitz.open(input_path)
@@ -100,7 +111,13 @@ def process_pdf(input_path, output_path):
 
         for article, (x, y, w, h) in article_boxes.items():
 
-            rect = fitz.Rect(x, y, x + w, y + h)
+            # ✅ lite padding så hela rutan täcks
+            rect = fitz.Rect(
+                x - 20,
+                y - 20,
+                x + w + 20,
+                y + h + 20
+            )
 
             page.insert_link({
                 "kind": fitz.LINK_URI,
@@ -119,7 +136,7 @@ def process_pdf(input_path, output_path):
 def index():
     return """
     <h2>DM Linker AI</h2>
-    <form method="post" action="/link" enctype="multipart/form-data">
+    <form action="/link" method="post" enctype="multipart/form-data">
         <input type="file" name="pdf" required>
         <button type="submit">Start</button>
     </form>
@@ -143,3 +160,4 @@ def link():
 # -------------------------
 if __name__ == "__main__":
     app.run()
+``
