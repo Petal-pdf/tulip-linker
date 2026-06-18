@@ -11,7 +11,7 @@ ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
 
 
 # -------------------------
-# Hitta artiklar
+# hitta artiklar
 # -------------------------
 def find_articles(text):
     return list(set(ARTICLE_RE.findall(text or "")))
@@ -22,7 +22,7 @@ def lookup(article):
 
 
 # -------------------------
-# ✅ SMART PRODUKT-RUTA (FUNKAR PÅ DIN LAYOUT)
+# smart produkt-ruta
 # -------------------------
 def find_product_rect(page, article):
     words = page.get_text("words")
@@ -35,14 +35,13 @@ def find_product_rect(page, article):
 
     rects = []
 
-    # 🔥 samla text nära artikeln (produkt område)
     for w in words:
         x0, y0, x1, y1 = w[:4]
 
         if (
-            abs(x0 - ax0) < 250 and   # samma kolumn
-            y0 > ay0 - 320 and        # upp (bild)
-            y0 < ay0 + 150            # ner (text)
+            abs(x0 - ax0) < 250 and
+            y0 > ay0 - 320 and
+            y0 < ay0 + 150
         ):
             rects.append(fitz.Rect(x0, y0, x1, y1))
 
@@ -53,7 +52,6 @@ def find_product_rect(page, article):
     for r in rects[1:]:
         rect |= r
 
-    # 🔥 expandera till hela produktkortet
     rect = fitz.Rect(
         rect.x0 - 140,
         rect.y0 - 260,
@@ -61,7 +59,6 @@ def find_product_rect(page, article):
         rect.y1 + 100,
     )
 
-    # håll inom sidan
     rect = fitz.Rect(
         max(0, rect.x0),
         max(0, rect.y0),
@@ -73,7 +70,7 @@ def find_product_rect(page, article):
 
 
 # -------------------------
-# PROCESS
+# process
 # -------------------------
 def process_pdf(input_path, output_path):
     doc = fitz.open(input_path)
@@ -98,17 +95,78 @@ def process_pdf(input_path, output_path):
 
 
 # -------------------------
-# ROUTES
+# UI (rosa 💗)
+# -------------------------
+HTML_PAGE = """
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM Linker 💗</title>
+
+<style>
+body {
+    font-family: Segoe UI, Arial;
+    background: #ffe4f0;
+    padding: 40px;
+}
+
+.card {
+    max-width: 700px;
+    margin: auto;
+    background: white;
+    padding: 30px;
+    border-radius: 18px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+}
+
+h1 {
+    margin-top: 0;
+}
+
+button {
+    background: #ff4fa3;
+    border: none;
+    padding: 14px 20px;
+    color: white;
+    font-weight: bold;
+    border-radius: 10px;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #ff2c8a;
+}
+
+input {
+    margin-bottom: 15px;
+}
+</style>
+</head>
+
+<body>
+<div class="card">
+<h1>💗 DM Linker</h1>
+
+<form method="post" action="/link" enctype="multipart/form-data">
+    <input type="file" name="pdf" required>
+    <br>
+    <button type="submit">Starta länkning</button>
+</form>
+
+</div>
+</body>
+</html>
+"""
+
+
+# -------------------------
+# routes
 # -------------------------
 @app.route("/")
 def index():
-    return """
-    <h2>DM Linker</h2>
-    <form action="/link" method="post" enctype="multipart/form-data">
-        <input type="file" name="pdf" required>
-        <button type="submit">Start</button>
-    </form>
-    """
+    return HTML_PAGE
 
 
 @app.route("/link", methods=["POST"])
