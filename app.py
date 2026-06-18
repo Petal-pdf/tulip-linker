@@ -8,30 +8,18 @@ import html as html_lib
 from pathlib import Path
 from urllib.parse import urljoin, quote_plus
 
-import fitz  # PyMuPDF
+import fitz
 import requests
-from flask import Flask, request, send_file, flash, redirect, url_for, render_template_string, abort
+from flask import Flask, request, send_file, redirect, url_for
 
 app = Flask(__name__)
-app.secret_key = "dm-linker-v11-lightweight"
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
 JOBS_ROOT = Path(tempfile.gettempdir()) / "dm_linker_jobs"
 JOBS_ROOT.mkdir(parents=True, exist_ok=True)
-CACHE_FILE = JOBS_ROOT / "url_cache.json"
 
 COUNTRY_BASE = {
     "SE": "https://www.jula.se",
-    "NO": "https://www.jula.no",
-    "FI": "https://www.jula.fi",
-    "PL": "https://www.jula.pl",
-}
-
-ALT_SEARCH_URLS = {
-    "SE": ["https://www.jula.se/search/?query={article}"],
-    "NO": ["https://www.jula.no/search/?query={article}"],
-    "FI": ["https://www.jula.fi/search/?query={article}"],
-    "PL": ["https://www.jula.pl/search/?query={article}"],
 }
 
 def job_dir(job_id):
@@ -40,206 +28,139 @@ def job_dir(job_id):
 def job_json_path(job_id):
     return job_dir(job_id) / "job.json"
 
-# ✅ FIX 1: SAFE SAVE (atomic write)
+# ✅ SAFE SAVE
 def save_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
     tmp.replace(path)
 
-# ✅ FIX 2: SAFE LOAD (no crash)
+# ✅ SAFE LOAD
 def load_json(path, fallback):
     if not path.exists():
         return fallback
-
     try:
-        text = path.read_text(encoding="utf-8").strip()
+        text = path.read_text().strip()
         if not text:
             return fallback
         return json.loads(text)
-    except Exception:
+    except:
         return fallback
 
 def save_job(job_id, job):
     save_json(job_json_path(job_id), job)
 
-# ✅ EXTRA SKYDD
 def load_job(job_id):
-    return load_json(
-        job_json_path(job_id),
-        {
-            "status": "expired",
-            "message": "Jobbet hittades inte.",
-            "country": "",
-            "pages_read": 0,
-            "pages_zero": [],
-            "total_articles": 0,
-            "inserted": 0,
-            "missing": [],
-            "output": None,
-            "error": "",
-        },
-    )
+    return load_json(job_json_path(job_id), {"status": "expired"})
 
 def update_job(job_id, **kwargs):
     job = load_job(job_id)
     job.update(kwargs)
     save_job(job_id, job)
 
-def load_cache():
-    return load_json(CACHE_FILE, {})
-
-def save_cache(cache):
-    save_json(CACHE_FILE, cache)
-
 def find_articles(text):
     return list(dict.fromkeys(ARTICLE_RE.findall(text or "")))
 
 def clean_url(url):
-    return html_lib.unescape(url).split("?")[0].split("#")[0].rstrip("/") + "/"
+    return html_lib.unescape(url).split("?")[0].strip()
 
-def is_valid_product_url(url, country, article):
-    if not url:
-        return False
-    base = COUNTRY_BASE[country]
-    c = clean_url(url)
-    return c.startswith(base) and "/catalog/" in c and article in c
+def lookup_article(article):
+    return f"https://www.jula.se/search/?query={article}"
 
-def fetch(session, url):
+# ✅ MAGIC: MERGE BLOCKS PER ARTIKEL
+def merge_blocks(blocks):
+    rects = [fitz.Rect(b[:4]) for b in blocks]
+    combined = rects[0]
+    for r in rects[1:]:
+        combined |= r
+
+    # Expand lite för att täcka hela rutan
+    return fitz.Rect(
+        combined.x0 - 20,
+        combined.y0 - 20,
+        combined.x1 + 20,
+        combined.y1 + 20,
+    )
+
+def run_job(job_id, input_path):
     try:
-        return session.get(url, timeout=10)
-    except:
-        return None
-
-def lookup_article(country, article, session, cache):
-    key = f"{country}_{article}"
-    if key in cache:
-        return cache[key]
-
-    for template in ALT_SEARCH_URLS[country]:
-        url = template.format(article=quote_plus(article))
-        r = fetch(session, url)
-        if not r:
-            continue
-        final = clean_url(r.url)
-        if is_valid_product_url(final, country, article):
-            cache[key] = final
-            return final
-
-    return None
-
-def lookup_all(country, articles, job_id):
-    cache = load_cache()
-    session = requests.Session()
-    results = {}
-
-    for i, a in enumerate(articles):
-        update_job(job_id, message=f"Slår upp {a}")
-        results[a] = lookup_article(country, a, session, cache)
-
-    save_cache(cache)
-    return results
-
-def run_job(job_id, input_path, country):
-    try:
-        update_job(job_id, status="running", message="Läser PDF...")
+        update_job(job_id, status="running")
 
         doc = fitz.open(input_path)
+
         articles = []
-        blocks_info = []
+        blocks_map = {}  # (page, article) -> blocks
 
         for pi, page in enumerate(doc):
             for block in page.get_text("blocks"):
                 found = find_articles(block[4])
                 if found:
-                    a = found[0]
-                    blocks_info.append((pi, block, a))
-                    for x in found:
-                        if x not in articles:
-                            articles.append(x)
+                    article = found[0]
 
-        update_job(job_id, total_articles=len(articles))
+                    key = (pi, article)
+                    blocks_map.setdefault(key, []).append(block)
 
-        lookup = lookup_all(country, articles, job_id)
+                    if article not in articles:
+                        articles.append(article)
 
-        inserted = 0
-        missing = set()
-
-        for pi, block, article in blocks_info:
-            url = lookup.get(article)
-            if not url:
-                missing.add(article)
-                continue
+        for (pi, article), blocks in blocks_map.items():
+            rect = merge_blocks(blocks)
+            url = lookup_article(article)
 
             doc[pi].insert_link({
                 "kind": fitz.LINK_URI,
-                "from": fitz.Rect(block[:4]),
+                "from": rect,
                 "uri": url,
             })
-            inserted += 1
 
         out = job_dir(job_id) / "output.pdf"
         doc.save(out)
         doc.close()
 
-        update_job(
-            job_id,
-            status="done",
-            output=str(out),
-            inserted=inserted,
-            missing=list(missing),
-            message="Klart"
-        )
+        update_job(job_id, status="done", output=str(out))
 
     except Exception:
-        update_job(
-            job_id,
-            status="error",
-            error=traceback.format_exc(),
-            message="CRASH"
-        )
+        update_job(job_id, status="error", error=traceback.format_exc())
+
+# ROUTES
 
 @app.route("/")
 def index():
     return '''
-    <form method="post" enctype="multipart/form-data" action="/link">
-    <input type="file" name="pdf">
-    <select name="country">
-        <option>SE</option>
-        <option>NO</option>
-    </select>
-    <button>Start</button>
+    <form method="post" action="/link" enctype="multipart/form-data">
+        <input type="file" name="pdf">
+        <button>Start</button>
     </form>
     '''
 
 @app.route("/link", methods=["POST"])
 def link():
     pdf = request.files["pdf"]
-    job_id = str(uuid.uuid4())
 
+    job_id = str(uuid.uuid4())
     d = job_dir(job_id)
     d.mkdir(parents=True, exist_ok=True)
 
     path = d / pdf.filename
     pdf.save(path)
 
-    save_job(job_id, {"status": "queued", "message": "Start..."})
+    save_job(job_id, {"status": "queued"})
 
-    threading.Thread(target=run_job, args=(job_id, path, "SE")).start()
+    threading.Thread(target=run_job, args=(job_id, path)).start()
 
     return redirect(f"/status/{job_id}")
 
 @app.route("/status/<job_id>")
 def status(job_id):
-    job = load_job(job_id)
-    return f"<pre>{job}</pre>"
+    return str(load_job(job_id))
 
 @app.route("/download/<job_id>")
 def download(job_id):
     job = load_job(job_id)
     if job.get("output"):
         return send_file(job["output"])
-    return "Not ready"
+    return "not ready"
 
 if __name__ == "__main__":
     app.run()
+``
