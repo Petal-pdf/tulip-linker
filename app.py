@@ -1,6 +1,5 @@
 import json
 import re
-import tempfile
 import uuid
 import threading
 import traceback
@@ -13,7 +12,9 @@ from flask import Flask, request, send_file, redirect
 app = Flask(__name__)
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
-ROOT = Path(tempfile.gettempdir()) / "dm_jobs"
+
+# ✅ FIX: använder lokal mapp istället för temp
+ROOT = Path("./jobs")
 ROOT.mkdir(exist_ok=True)
 
 # -------------------------
@@ -60,7 +61,7 @@ def lookup(article):
     return f"https://www.jula.se/search/?query={quote_plus(article)}"
 
 # -------------------------
-# HERO MODE (stora ytor)
+# HERO MODE
 # -------------------------
 def hero_rect(page, article):
     words = page.get_text("words")
@@ -71,14 +72,14 @@ def hero_rect(page, article):
     x0, y0, x1, y1 = hits[0][:4]
 
     return fitz.Rect(
-        max(0, x0 - 400),
-        max(0, y0 - 300),
-        min(page.rect.width, x1 + 400),
-        min(page.rect.height, y1 + 300),
+        max(0, x0 - 500),
+        max(0, y0 - 400),
+        min(page.rect.width, x1 + 500),
+        min(page.rect.height, y1 + 400),
     )
 
 # -------------------------
-# GRID MODE (hela rutor)
+# GRID MODE
 # -------------------------
 def build_grid(page, cols=3, rows=4):
     w = page.rect.width
@@ -126,7 +127,6 @@ def run_job(job_id, pdf_path):
 
             page_articles = list(set(page_articles))
 
-            # välj mode automatiskt
             mode = "grid" if len(page_articles) > 4 else "hero"
 
             if mode == "grid":
@@ -140,7 +140,6 @@ def run_job(job_id, pdf_path):
                             "from": rect,
                             "uri": lookup(article)
                         })
-
             else:
                 for article in page_articles:
                     rect = hero_rect(page, article)
@@ -151,7 +150,7 @@ def run_job(job_id, pdf_path):
                             "uri": lookup(article)
                         })
 
-        out = Path(pdf_path).with_name("output.pdf")
+        out = Path(pdf_path).parent / "output.pdf"
         doc.save(out)
         doc.close()
 
@@ -166,7 +165,7 @@ def run_job(job_id, pdf_path):
 @app.route("/")
 def index():
     return '''
-    <form method="post" enctype="multipart/form-data" action="/link">
+    <form action="/link" method="post" enctype="multipart/form-data">
         <input type="file" name="pdf">
         <button>Start</button>
     </form>
@@ -184,6 +183,7 @@ def link():
     pdf.save(path)
 
     save_job(job_id, {"status": "queued"})
+    print("JOB CREATED:", job_id)  # 🔥 debug
 
     threading.Thread(target=run_job, args=(job_id, path)).start()
 
