@@ -12,8 +12,6 @@ from flask import Flask, request, send_file, redirect
 app = Flask(__name__)
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
-
-# ✅ FIX: använder lokal mapp istället för temp
 ROOT = Path("./jobs")
 ROOT.mkdir(exist_ok=True)
 
@@ -61,54 +59,52 @@ def lookup(article):
     return f"https://www.jula.se/search/?query={quote_plus(article)}"
 
 # -------------------------
-# HERO MODE
+# 🔥 BEST FUNCTION (din typ av layout)
 # -------------------------
-def hero_rect(page, article):
+def find_product_rect(page, article):
     words = page.get_text("words")
-    hits = [w for w in words if w[4] == article]
-    if not hits:
+
+    anchors = [w for w in words if w[4] == article]
+    if not anchors:
         return None
 
-    x0, y0, x1, y1 = hits[0][:4]
+    ax0, ay0, ax1, ay1 = anchors[0][:4]
 
-    return fitz.Rect(
-        max(0, x0 - 500),
-        max(0, y0 - 400),
-        min(page.rect.width, x1 + 500),
-        min(page.rect.height, y1 + 400),
+    # samla ord nära artikeln (samma "rad/produkt")
+    cluster = []
+    for w in words:
+        x0, y0, x1, y1 = w[:4]
+
+        if (
+            abs(y0 - ay0) < 120 and
+            abs(x0 - ax0) < 400
+        ):
+            cluster.append(fitz.Rect(x0, y0, x1, y1))
+
+    if not cluster:
+        return None
+
+    rect = cluster[0]
+    for r in cluster[1:]:
+        rect |= r
+
+    # 🔥 expansion (detta gör hela produkten klickbar)
+    rect = fitz.Rect(
+        rect.x0 - 180,
+        rect.y0 - 220,
+        rect.x1 + 180,
+        rect.y1 + 180,
     )
 
-# -------------------------
-# GRID MODE
-# -------------------------
-def build_grid(page, cols=3, rows=4):
-    w = page.rect.width
-    h = page.rect.height
+    # håll inom sidan
+    rect = fitz.Rect(
+        max(0, rect.x0),
+        max(0, rect.y0),
+        min(page.rect.width, rect.x1),
+        min(page.rect.height, rect.y1),
+    )
 
-    cell_w = w / cols
-    cell_h = h / rows
-
-    grid = []
-    for i in range(cols):
-        for j in range(rows):
-            grid.append(fitz.Rect(
-                i * cell_w,
-                j * cell_h,
-                (i + 1) * cell_w,
-                (j + 1) * cell_h
-            ))
-    return grid
-
-def match_grid(page, article, grid):
-    words = page.get_text("words")
-
-    for w in words:
-        if w[4] == article:
-            px, py = w[0], w[1]
-            for rect in grid:
-                if rect.contains(fitz.Point(px, py)):
-                    return rect
-    return None
+    return rect
 
 # -------------------------
 # JOB ENGINE
@@ -120,35 +116,19 @@ def run_job(job_id, pdf_path):
         doc = fitz.open(pdf_path)
 
         for page in doc:
-            # hitta artiklar på sidan
-            page_articles = []
             for block in page.get_text("blocks"):
-                page_articles += find_articles(block[4])
+                articles = find_articles(block[4])
 
-            page_articles = list(set(page_articles))
+                for article in articles:
+                    rect = find_product_rect(page, article)
+                    if not rect:
+                        continue
 
-            mode = "grid" if len(page_articles) > 4 else "hero"
-
-            if mode == "grid":
-                grid = build_grid(page)
-
-                for article in page_articles:
-                    rect = match_grid(page, article, grid)
-                    if rect:
-                        page.insert_link({
-                            "kind": fitz.LINK_URI,
-                            "from": rect,
-                            "uri": lookup(article)
-                        })
-            else:
-                for article in page_articles:
-                    rect = hero_rect(page, article)
-                    if rect:
-                        page.insert_link({
-                            "kind": fitz.LINK_URI,
-                            "from": rect,
-                            "uri": lookup(article)
-                        })
+                    page.insert_link({
+                        "kind": fitz.LINK_URI,
+                        "from": rect,
+                        "uri": lookup(article)
+                    })
 
         out = Path(pdf_path).parent / "output.pdf"
         doc.save(out)
@@ -183,9 +163,9 @@ def link():
     pdf.save(path)
 
     save_job(job_id, {"status": "queued"})
-    print("JOB CREATED:", job_id)  # 🔥 debug
+    print("JOB:", job_id)
 
-    threading.Thread(target=run_job, args=(job_id, path)).start()
+    threading.Thread(target=run_job, args=(job_id, path), daemon=True).start()
 
     return redirect(f"/status/{job_id}")
 
