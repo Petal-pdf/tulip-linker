@@ -129,7 +129,20 @@ def save_json(path, obj):
 def load_json(path, fallback):
     if not path.exists():
         return fallback
-    return json.loads(path.read_text(encoding="utf-8"))
+
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+
+        if not text:
+            return fallback  # filen är tom → använd fallback
+
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+        return fallback
+
+    except Exception:
+        return fallback
 
 def save_job(job_id, job):
     save_json(job_json_path(job_id), job)
