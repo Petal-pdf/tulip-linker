@@ -1,53 +1,13 @@
-import json
 import re
-import uuid
-import threading
-import traceback
 from pathlib import Path
 from urllib.parse import quote_plus
 
 import fitz
-from flask import Flask, request, send_file, redirect
+from flask import Flask, request, send_file
 
 app = Flask(__name__)
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
-ROOT = Path("./jobs")
-ROOT.mkdir(exist_ok=True)
-
-# -------------------------
-# JSON SAFE
-# -------------------------
-def job_file(job_id):
-    return ROOT / job_id / "job.json"
-
-def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data), encoding="utf-8")
-    tmp.replace(path)
-
-def load_json(path, fallback):
-    if not path.exists():
-        return fallback
-    try:
-        t = path.read_text().strip()
-        if not t:
-            return fallback
-        return json.loads(t)
-    except:
-        return fallback
-
-def save_job(job_id, data):
-    save_json(job_file(job_id), data)
-
-def load_job(job_id):
-    return load_json(job_file(job_id), {"status": "expired"})
-
-def update_job(job_id, **kwargs):
-    job = load_job(job_id)
-    job.update(kwargs)
-    save_job(job_id, job)
 
 # -------------------------
 # FIND ARTICLES
@@ -59,7 +19,7 @@ def lookup(article):
     return f"https://www.jula.se/search/?query={quote_plus(article)}"
 
 # -------------------------
-# 🔥 BEST FUNCTION (din typ av layout)
+# PRODUCT RECT (STORA RUTOR)
 # -------------------------
 def find_product_rect(page, article):
     words = page.get_text("words")
@@ -70,7 +30,6 @@ def find_product_rect(page, article):
 
     ax0, ay0, ax1, ay1 = anchors[0][:4]
 
-    # samla ord nära artikeln (samma "rad/produkt")
     cluster = []
     for w in words:
         x0, y0, x1, y1 = w[:4]
@@ -88,7 +47,7 @@ def find_product_rect(page, article):
     for r in cluster[1:]:
         rect |= r
 
-    # 🔥 expansion (detta gör hela produkten klickbar)
+    # 🔥 gör rutan stor
     rect = fitz.Rect(
         rect.x0 - 180,
         rect.y0 - 220,
@@ -96,7 +55,6 @@ def find_product_rect(page, article):
         rect.y1 + 180,
     )
 
-    # håll inom sidan
     rect = fitz.Rect(
         max(0, rect.x0),
         max(0, rect.y0),
@@ -107,40 +65,31 @@ def find_product_rect(page, article):
     return rect
 
 # -------------------------
-# JOB ENGINE
+# PDF PROCESS
 # -------------------------
-def run_job(job_id, pdf_path):
-    try:
-        update_job(job_id, status="running")
+def process_pdf(input_path, output_path):
+    doc = fitz.open(input_path)
 
-        doc = fitz.open(pdf_path)
+    for page in doc:
+        for block in page.get_text("blocks"):
+            articles = find_articles(block[4])
 
-        for page in doc:
-            for block in page.get_text("blocks"):
-                articles = find_articles(block[4])
+            for article in articles:
+                rect = find_product_rect(page, article)
+                if not rect:
+                    continue
 
-                for article in articles:
-                    rect = find_product_rect(page, article)
-                    if not rect:
-                        continue
+                page.insert_link({
+                    "kind": fitz.LINK_URI,
+                    "from": rect,
+                    "uri": lookup(article)
+                })
 
-                    page.insert_link({
-                        "kind": fitz.LINK_URI,
-                        "from": rect,
-                        "uri": lookup(article)
-                    })
-
-        out = Path(pdf_path).parent / "output.pdf"
-        doc.save(out)
-        doc.close()
-
-        update_job(job_id, status="done", output=str(out))
-
-    except Exception:
-        update_job(job_id, status="error", error=traceback.format_exc())
+    doc.save(output_path)
+    doc.close()
 
 # -------------------------
-# ROUTES
+# ROUTES (NO THREADS)
 # -------------------------
 @app.route("/")
 def index():
@@ -155,30 +104,15 @@ def index():
 def link():
     pdf = request.files["pdf"]
 
-    job_id = str(uuid.uuid4())
-    folder = ROOT / job_id
-    folder.mkdir(parents=True, exist_ok=True)
+    input_path = Path("input.pdf")
+    output_path = Path("output.pdf")
 
-    path = folder / pdf.filename
-    pdf.save(path)
+    pdf.save(input_path)
 
-    save_job(job_id, {"status": "queued"})
-    print("JOB:", job_id)
+    # ✅ KÖR DIREKT (INGA THREADS)
+    process_pdf(input_path, output_path)
 
-    threading.Thread(target=run_job, args=(job_id, path), daemon=True).start()
-
-    return redirect(f"/status/{job_id}")
-
-@app.route("/status/<job_id>")
-def status(job_id):
-    return str(load_job(job_id))
-
-@app.route("/download/<job_id>")
-def download(job_id):
-    job = load_job(job_id)
-    if job.get("output"):
-        return send_file(job["output"])
-    return "not ready"
+    return send_file(output_path, as_attachment=True)
 
 # -------------------------
 if __name__ == "__main__":
