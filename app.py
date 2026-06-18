@@ -8,20 +8,19 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import fitz
-import requests
-from flask import Flask, request, send_file, redirect, url_for
+from flask import Flask, request, send_file, redirect
 
 app = Flask(__name__)
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
-JOBS_ROOT = Path(tempfile.gettempdir()) / "dm_jobs"
-JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+ROOT = Path(tempfile.gettempdir()) / "dm_jobs"
+ROOT.mkdir(exist_ok=True)
 
-# ------------------------
+# -------------------------
 # JSON SAFE
-# ------------------------
-def job_path(job_id):
-    return JOBS_ROOT / job_id / "job.json"
+# -------------------------
+def job_file(job_id):
+    return ROOT / job_id / "job.json"
 
 def save_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -33,128 +32,141 @@ def load_json(path, fallback):
     if not path.exists():
         return fallback
     try:
-        text = path.read_text().strip()
-        if not text:
+        t = path.read_text().strip()
+        if not t:
             return fallback
-        return json.loads(text)
+        return json.loads(t)
     except:
         return fallback
 
-# ------------------------
-# JOB STATE
-# ------------------------
 def save_job(job_id, data):
-    save_json(job_path(job_id), data)
+    save_json(job_file(job_id), data)
 
 def load_job(job_id):
-    return load_json(job_path(job_id), {"status": "expired"})
+    return load_json(job_file(job_id), {"status": "expired"})
 
 def update_job(job_id, **kwargs):
     job = load_job(job_id)
     job.update(kwargs)
     save_job(job_id, job)
 
-# ------------------------
-# ARTICLE FINDING
-# ------------------------
+# -------------------------
+# FIND ARTICLES
+# -------------------------
 def find_articles(text):
-    return list(dict.fromkeys(ARTICLE_RE.findall(text or "")))
+    return list(set(ARTICLE_RE.findall(text or "")))
 
-def lookup_article(article):
+def lookup(article):
     return f"https://www.jula.se/search/?query={quote_plus(article)}"
 
-# ------------------------
-# 🤖 AI-LITE: FIND PRODUCT RECT
-# ------------------------
-def find_product_rect(page, article):
+# -------------------------
+# HERO MODE (stora ytor)
+# -------------------------
+def hero_rect(page, article):
+    words = page.get_text("words")
+    hits = [w for w in words if w[4] == article]
+    if not hits:
+        return None
+
+    x0, y0, x1, y1 = hits[0][:4]
+
+    return fitz.Rect(
+        max(0, x0 - 400),
+        max(0, y0 - 300),
+        min(page.rect.width, x1 + 400),
+        min(page.rect.height, y1 + 300),
+    )
+
+# -------------------------
+# GRID MODE (hela rutor)
+# -------------------------
+def build_grid(page, cols=3, rows=4):
+    w = page.rect.width
+    h = page.rect.height
+
+    cell_w = w / cols
+    cell_h = h / rows
+
+    grid = []
+    for i in range(cols):
+        for j in range(rows):
+            grid.append(fitz.Rect(
+                i * cell_w,
+                j * cell_h,
+                (i + 1) * cell_w,
+                (j + 1) * cell_h
+            ))
+    return grid
+
+def match_grid(page, article, grid):
     words = page.get_text("words")
 
-    anchors = [w for w in words if w[4] == article]
-    if not anchors:
-        return None
-
-    ax0, ay0, ax1, ay1 = anchors[0][:4]
-
-    # ✅ samla alla ord som ligger nära artikeln
-    cluster = []
     for w in words:
-        x0, y0, x1, y1 = w[:4]
+        if w[4] == article:
+            px, py = w[0], w[1]
+            for rect in grid:
+                if rect.contains(fitz.Point(px, py)):
+                    return rect
+    return None
 
-        if abs(x0 - ax0) < 220 and abs(y0 - ay0) < 160:
-            cluster.append(fitz.Rect(x0, y0, x1, y1))
-
-    if not cluster:
-        return None
-
-    rect = cluster[0]
-    for r in cluster[1:]:
-        rect |= r
-
-    # ✅ EXPANDERA till hela rutan
-    rect = fitz.Rect(
-        rect.x0 - 80,
-        rect.y0 - 80,
-        rect.x1 + 80,
-        rect.y1 + 80,
-    )
-
-    # clamp till sida
-    rect = fitz.Rect(
-        max(0, rect.x0),
-        max(0, rect.y0),
-        min(page.rect.width, rect.x1),
-        min(page.rect.height, rect.y1),
-    )
-
-    return rect
-
-# ------------------------
-# JOB
-# ------------------------
+# -------------------------
+# JOB ENGINE
+# -------------------------
 def run_job(job_id, pdf_path):
     try:
         update_job(job_id, status="running")
 
         doc = fitz.open(pdf_path)
-        articles = set()
 
-        # hitta artiklar
         for page in doc:
+            # hitta artiklar på sidan
+            page_articles = []
             for block in page.get_text("blocks"):
-                for a in find_articles(block[4]):
-                    articles.add(a)
+                page_articles += find_articles(block[4])
 
-        # insert links
-        for pi, page in enumerate(doc):
-            for article in articles:
-                rect = find_product_rect(page, article)
-                if not rect:
-                    continue
+            page_articles = list(set(page_articles))
 
-                url = lookup_article(article)
+            # välj mode automatiskt
+            mode = "grid" if len(page_articles) > 4 else "hero"
 
-                page.insert_link({
-                    "kind": fitz.LINK_URI,
-                    "from": rect,
-                    "uri": url,
-                })
+            if mode == "grid":
+                grid = build_grid(page)
 
-        output = Path(pdf_path).with_name("output.pdf")
-        doc.save(output)
+                for article in page_articles:
+                    rect = match_grid(page, article, grid)
+                    if rect:
+                        page.insert_link({
+                            "kind": fitz.LINK_URI,
+                            "from": rect,
+                            "uri": lookup(article)
+                        })
+
+            else:
+                for article in page_articles:
+                    rect = hero_rect(page, article)
+                    if rect:
+                        page.insert_link({
+                            "kind": fitz.LINK_URI,
+                            "from": rect,
+                            "uri": lookup(article)
+                        })
+
+        out = Path(pdf_path).with_name("output.pdf")
+        doc.save(out)
         doc.close()
 
-        update_job(job_id, status="done", output=str(output))
+        update_job(job_id, status="done", output=str(out))
 
     except Exception:
         update_job(job_id, status="error", error=traceback.format_exc())
 
-# ------------------------
+# -------------------------
 # ROUTES
-# ------------------------
+# -------------------------
 @app.route("/")
 def index():
     return '''
-    <form method="post" action="/link" enctype="multipart/form-data">
+    <form method="post" enctype="multipart/form-data" action="/link">
         <input type="file" name="pdf">
         <button>Start</button>
     </form>
@@ -165,7 +177,7 @@ def link():
     pdf = request.files["pdf"]
 
     job_id = str(uuid.uuid4())
-    folder = JOBS_ROOT / job_id
+    folder = ROOT / job_id
     folder.mkdir(parents=True, exist_ok=True)
 
     path = folder / pdf.filename
@@ -188,6 +200,6 @@ def download(job_id):
         return send_file(job["output"])
     return "not ready"
 
-# ------------------------
+# -------------------------
 if __name__ == "__main__":
     app.run()
