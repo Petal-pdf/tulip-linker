@@ -1,7 +1,6 @@
 import re
 import tempfile
 from urllib.parse import quote_plus
- 
 import fitz
 from flask import Flask, request, send_file
  
