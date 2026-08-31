@@ -3,7 +3,6 @@ import tempfile
 from urllib.parse import quote_plus
 import fitz
 from flask import Flask, request, send_file
- 
 app = Flask(__name__)
  
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
