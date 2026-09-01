@@ -3,11 +3,15 @@ import tempfile
 from urllib.parse import quote_plus
 
 import fitz
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, send_file
 
 app = Flask(__name__)
 
 ARTICLE_RE = re.compile(r"\b\d{6,7}\b")
+
+URL_CACHE = {}
 
 
 def find_articles(text):
@@ -15,13 +19,64 @@ def find_articles(text):
 
 
 def lookup(article):
-    return f"https://www.jula.se/search/?query={quote_plus(article)}"
+
+    if article in URL_CACHE:
+        return URL_CACHE[article]
+
+    search_url = (
+        f"https://www.jula.se/search/?query={quote_plus(article)}"
+    )
+
+    try:
+        response = requests.get(
+            search_url,
+            timeout=15,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0"
+                )
+            }
+        )
+
+        response.raise_for_status()
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        links = soup.find_all("a", href=True)
+
+        for link in links:
+
+            href = link["href"]
+
+            if "/catalog/" not in href:
+                continue
+
+            if href.startswith("/"):
+                href = "https://www.jula.se" + href
+
+            URL_CACHE[article] = href
+            return href
+
+    except Exception as e:
+        print(
+            f"Fel vid uppslagning "
+            f"{article}: {e}"
+        )
+
+    return None
 
 
 def find_product_rect(page, article):
+
     words = page.get_text("words")
 
-    anchors = [w for w in words if w[4] == article]
+    anchors = [
+        w for w in words
+        if w[4] == article
+    ]
 
     if not anchors:
         return None
@@ -31,6 +86,7 @@ def find_product_rect(page, article):
     rects = []
 
     for w in words:
+
         x0, y0, x1, y1 = w[:4]
 
         if (
@@ -38,7 +94,14 @@ def find_product_rect(page, article):
             and y0 > ay0 - 350
             and y0 < ay0 + 220
         ):
-            rects.append(fitz.Rect(x0, y0, x1, y1))
+            rects.append(
+                fitz.Rect(
+                    x0,
+                    y0,
+                    x1,
+                    y1
+                )
+            )
 
     if not rects:
         return None
@@ -66,31 +129,58 @@ def find_product_rect(page, article):
 
 
 def process_pdf(input_path, output_path):
+
     doc = fitz.open(input_path)
 
-    for page in doc:
-        blocks = page.get_text("blocks")
+    for page_index, page in enumerate(doc):
 
-        for block in blocks:
-            text = block[4]
+        print(
+            f"Bearbetar sida "
+            f"{page_index + 1}/{len(doc)}"
+        )
 
-            articles = find_articles(text)
+        text = page.get_text()
 
-            for article in articles:
-                rect = find_product_rect(page, article)
+        articles = find_articles(text)
 
-                if rect is None:
-                    continue
+        for article in articles:
 
-                page.insert_link(
-                    {
-                        "kind": fitz.LINK_URI,
-                        "from": rect,
-                        "uri": lookup(article),
-                    }
+            product_url = lookup(article)
+
+            if not product_url:
+                print(
+                    f"Ingen produkt hittad: "
+                    f"{article}"
                 )
+                continue
 
-    doc.save(output_path)
+            rect = find_product_rect(
+                page,
+                article
+            )
+
+            if rect is None:
+                continue
+
+            page.insert_link(
+                {
+                    "kind": fitz.LINK_URI,
+                    "from": rect,
+                    "uri": product_url,
+                }
+            )
+
+            print(
+                f"{article} -> "
+                f"{product_url}"
+            )
+
+    doc.save(
+        output_path,
+        garbage=4,
+        deflate=True
+    )
+
     doc.close()
 
 
@@ -99,8 +189,7 @@ HTML_PAGE = """
 <html lang="sv">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DM Linker 💗</title>
+<title>DM Linker</title>
 
 <style>
 body{
@@ -115,7 +204,6 @@ body{
     background:white;
     padding:30px;
     border-radius:18px;
-    box-shadow:0 6px 20px rgba(0,0,0,.1);
 }
 
 button{
@@ -123,35 +211,30 @@ button{
     border:none;
     padding:14px 20px;
     color:white;
-    font-weight:bold;
     border-radius:10px;
     cursor:pointer;
 }
-
-button:hover{
-    background:#ff2c8a;
-}
 </style>
-</head>
 
+</head>
 <body>
 
 <div class="card">
 
-<h1>💗 DM Linker</h1>
+<h1>DM Linker</h1>
 
-<form 
+/link
+
 <input
     type="file"
     name="pdf"
     accept=".pdf"
-    required
->
+    required>
 
 <br><br>
 
 <button type="submit">
-    Starta länkning
+Starta länkning
 </button>
 
 </form>
@@ -193,7 +276,10 @@ def link():
             "_linked.pdf"
         )
 
-    process_pdf(src.name, output_path)
+    process_pdf(
+        src.name,
+        output_path
+    )
 
     return send_file(
         output_path,
