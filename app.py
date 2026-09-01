@@ -3,7 +3,6 @@ import re
 import csv
 import json
 import time
-import zipfile
 import tempfile
 import difflib
 import logging
@@ -303,21 +302,86 @@ HTML_PAGE = """
 <style>
 body{font-family:Arial,sans-serif;background:#f5dce8;padding:40px;}
 .card{max-width:700px;margin:auto;background:white;padding:40px;border-radius:20px;}
-button{background:#ff4fa3;color:white;border:none;padding:15px 25px;border-radius:10px;cursor:pointer;}
+button{background:#ff4fa3;color:white;border:none;padding:15px 25px;border-radius:10px;cursor:pointer;font-size:1em;}
+button:disabled{background:#f5a9cf;cursor:not-allowed;}
+.spinner{
+    display:inline-block;
+    width:16px;height:16px;
+    border:3px solid #ffffff66;
+    border-top-color:#ffffff;
+    border-radius:50%;
+    animation:spin 0.8s linear infinite;
+    vertical-align:middle;
+    margin-right:8px;
+}
+@keyframes spin{to{transform:rotate(360deg);}}
+#status{margin-top:16px;font-size:0.95em;}
+#status.ok{color:#1a9c4a;}
+#status.error{color:#d92d2d;}
+#status.working{color:#555;}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>DM Linker</h1>
-<form action="/link" method="post" enctype="multipart/form-data">
-<input type="file" name="pdf" accept=".pdf" required>
+<form id="linkForm">
+<input type="file" id="pdfInput" name="pdf" accept=".pdf" required>
 <br><br>
-<button type="submit">Starta länkning</button>
+<button type="submit" id="submitBtn">Starta länkning</button>
 </form>
-<p style="color:#888;font-size:0.9em;">
-Resultatet laddas ner som en zip med: linked.pdf, links.csv och qa_report.json
+<p id="status" style="color:#888;font-size:0.9em;">
+Resultatet laddas ner som en färdiglänkad PDF.
 </p>
 </div>
+
+<script>
+const form = document.getElementById("linkForm");
+const btn = document.getElementById("submitBtn");
+const status = document.getElementById("status");
+const fileInput = document.getElementById("pdfInput");
+
+form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    if (!fileInput.files.length) return;
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Länkar PDF...';
+    status.className = "working";
+    status.textContent = "Bearbetar - detta kan ta en stund beroende på hur många produkter DM:en innehåller...";
+
+    const formData = new FormData();
+    formData.append("pdf", fileInput.files[0]);
+
+    try {
+        const resp = await fetch("/link", { method: "POST", body: formData });
+
+        if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(text || ("Serverfel (" + resp.status + ")"));
+        }
+
+        const blob = await resp.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "linked.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+
+        status.className = "ok";
+        status.textContent = "Klart! Den länkade PDF:en har laddats ner.";
+    } catch (err) {
+        status.className = "error";
+        status.textContent = "Något gick fel: " + err.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Starta länkning";
+    }
+});
+</script>
 </body>
 </html>
 """
@@ -344,30 +408,31 @@ def link():
 
     uploaded_pdf = request.files["pdf"]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        src_path = os.path.join(tmp, "input.pdf")
-        uploaded_pdf.save(src_path)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "input.pdf")
+            uploaded_pdf.save(src_path)
 
-        out_dir = os.path.join(tmp, "out")
-        out_pdf, out_csv, out_qa, _ = process_pdf(src_path, out_dir)
+            out_dir = os.path.join(tmp, "out")
+            out_pdf, out_csv, out_qa, qa_report = process_pdf(src_path, out_dir)
 
-        zip_path = os.path.join(tmp, "resultat.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(out_pdf, "linked.pdf")
-            zf.write(out_csv, "links.csv")
-            zf.write(out_qa, "qa_report.json")
+            # CSV och QA-rapport skrivs fortfarande ut i loggen så du kan
+            # se vad som hände, men skickas inte till användaren - de vill
+            # bara ha PDF:en tillbaka.
+            log.info(f"QA: {qa_report['antal_lankar_skapade']}/{qa_report['antal_produkter_hittade']} länkade.")
 
-        # send_file behöver läsa filen innan tempdir städas, så vi
-        # kopierar zip-bytes till minnet först
-        with open(zip_path, "rb") as f:
-            data = f.read()
+            with open(out_pdf, "rb") as f:
+                data = f.read()
+    except Exception as e:
+        log.exception("Fel vid länkning av PDF")
+        return f"Kunde inte länka PDF:en: {e}", 500
 
     from io import BytesIO
     return send_file(
         BytesIO(data),
         as_attachment=True,
-        download_name="dm_linker_resultat.zip",
-        mimetype="application/zip",
+        download_name="linked.pdf",
+        mimetype="application/pdf",
     )
 
 
