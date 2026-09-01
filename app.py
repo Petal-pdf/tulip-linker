@@ -103,43 +103,48 @@ HTML_PAGE = """
 <title>DM Linker 💗</title>
 
 <style>
-body{
-    font-family:Segoe UI,Arial,sans-serif;
-    background:#ffe4f0;
-    padding:40px;
+body {
+    font-family: Segoe UI, Arial, sans-serif;
+    background: #ffe4f0;
+    padding: 40px;
 }
 
-.card{
-    max-width:700px;
-    margin:auto;
-    background:white;
-    padding:30px;
-    border-radius:18px;
-    box-shadow:0 6px 20px rgba(0,0,0,.1);
+.card {
+    max-width: 700px;
+    margin: auto;
+    background: white;
+    padding: 30px;
+    border-radius: 18px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.1);
 }
 
-button{
-    background:#ff4fa3;
-    border:none;
-    padding:14px 20px;
-    color:white;
-    font-weight:bold;
-    border-radius:10px;
-    cursor:pointer;
+button {
+    background: #ff4fa3;
+    border: none;
+    padding: 14px 20px;
+    color: white;
+    font-weight: bold;
+    border-radius: 10px;
+    cursor: pointer;
 }
 
-button:hover{
-    background:#ff2c8a;
+button:hover {
+    background: #ff2c8a;
 }
 </style>
 </head>
+
 <body>
 
 <div class="card">
 
 <h1>💗 DM Linker</h1>
 
-<form method="post" action="/link" enctypef"
+/link
+
+<input
+    type="file"
+    name="pdf"
     accept=".pdf"
     required
 >
@@ -195,7 +200,7 @@ def link():
         output_path,
         as_attachment=True,
         download_name="linked.pdf",
-        mimetype="application/pdf",
+        mimetype="application/pdf"
     )
 
 
