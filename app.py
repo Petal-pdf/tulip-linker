@@ -1,6 +1,7 @@
 import os
-import tempfile
+import re
 import fitz
+import tempfile
 
 from flask import (
     Flask,
@@ -10,15 +11,84 @@ from flask import (
 
 app = Flask(__name__)
 
+ARTICLE_RE = r"\b\d{6}\b"
 
-def process_pdf(input_pdf, output_pdf):
+
+def detect_domain(filename):
+
+    filename = filename.lower()
+
+    if "_pl" in filename:
+        return "https://www.jula.pl"
+
+    if "_no" in filename:
+        return "https://www.jula.no"
+
+    if "_fi" in filename:
+        return "https://www.jula.fi"
+
+    return "https://www.jula.se"
+
+
+def article_url(domain, article):
+
+    return f"{domain}/a-{article}/"
+
+
+def process_pdf(
+    input_pdf,
+    output_pdf,
+    filename
+):
+
+    domain = detect_domain(filename)
 
     doc = fitz.open(input_pdf)
 
-    # TEST:
-    # öppnar och sparar bara om PDF
+    for page in doc:
 
-    doc.save(output_pdf)
+        blocks = page.get_text("blocks")
+
+        for block in blocks:
+
+            text = block[4]
+
+            matches = re.findall(
+                ARTICLE_RE,
+                text
+            )
+
+            if not matches:
+                continue
+
+            # FIRST ONLY REGELN
+            article = matches[0]
+
+            url = article_url(
+                domain,
+                article
+            )
+
+            rect = fitz.Rect(
+                block[0],
+                block[1],
+                block[2],
+                block[3]
+            )
+
+            page.insert_link(
+                {
+                    "kind": fitz.LINK_URI,
+                    "from": rect,
+                    "uri": url
+                }
+            )
+
+    doc.save(
+        output_pdf,
+        garbage=4,
+        deflate=True
+    )
 
     doc.close()
 
@@ -33,31 +103,46 @@ def index():
 
 <head>
 
+<meta charset="utf-8">
+
 <title>DM Linker</title>
 
 <style>
 
 body{
-    font-family:Arial;
+    font-family:Arial,sans-serif;
     background:#f5dce8;
     padding:50px;
 }
 
 .card{
+
     max-width:700px;
+
     margin:auto;
+
     background:white;
+
     padding:40px;
+
     border-radius:20px;
 }
 
 button{
+
     background:#ff4fa3;
+
     color:white;
+
     border:none;
+
     padding:15px 25px;
+
     border-radius:10px;
+
     cursor:pointer;
+
+    font-size:16px;
 }
 
 </style>
@@ -71,17 +156,12 @@ button{
 <h1>DM Linker</h1>
 
 <form
-    action="/link"
-    methodame="pdf"
-    accept=".pdf"
-    required>
+action="/link"
+method="POST"
+enctype="multipart/form-data">
 
-<br><br>
-
-<button type="submit">
-
+<inputbutton type="submit">
 Starta länkning
-
 </button>
 
 </form>
@@ -94,11 +174,8 @@ Starta länkning
 """
 
 
-@app.route(
-    "/health"
-)
+@app.route("/health")
 def health():
-
     return "OK"
 
 
@@ -109,7 +186,6 @@ def health():
 def link_pdf():
 
     if "pdf" not in request.files:
-
         return "Ingen PDF uppladdad", 400
 
     pdf = request.files["pdf"]
@@ -128,7 +204,8 @@ def link_pdf():
 
     process_pdf(
         src.name,
-        output_pdf
+        output_pdf,
+        pdf.filename
     )
 
     return send_file(
@@ -150,3 +227,4 @@ if __name__ == "__main__":
             )
         )
     )
+``
