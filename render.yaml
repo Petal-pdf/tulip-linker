@@ -1,6 +1,5 @@
 services:
   - type: web
-    name: dm-linker
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
