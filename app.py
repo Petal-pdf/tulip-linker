@@ -68,8 +68,6 @@ def find_product_rect(page, article):
 def process_pdf(input_path, output_path):
     doc = fitz.open(input_path)
 
-    linked = set()
-
     for page in doc:
         blocks = page.get_text("blocks")
 
@@ -84,20 +82,6 @@ def process_pdf(input_path, output_path):
                 if rect is None:
                     continue
 
-                key = (
-                    page.number,
-                    article,
-                    round(rect.x0),
-                    round(rect.y0),
-                    round(rect.x1),
-                    round(rect.y1),
-                )
-
-                if key in linked:
-                    continue
-
-                linked.add(key)
-
                 page.insert_link(
                     {
                         "kind": fitz.LINK_URI,
@@ -106,7 +90,7 @@ def process_pdf(input_path, output_path):
                     }
                 )
 
-    doc.save(output_path, garbage=4, deflate=True)
+    doc.save(output_path)
     doc.close()
 
 
@@ -134,14 +118,6 @@ body{
     box-shadow:0 6px 20px rgba(0,0,0,.1);
 }
 
-h1{
-    margin-top:0;
-}
-
-input{
-    margin-bottom:15px;
-}
-
 button{
     background:#ff4fa3;
     border:none;
@@ -157,28 +133,26 @@ button:hover{
 }
 </style>
 </head>
-
 <body>
 
 <div class="card">
 
 <h1>💗 DM Linker</h1>
 
-<form method="post" action="/link" enctype="  name="pdf"
-        accept=".pdf"
-        required
-    >
+<form method="post" action="/link" enctypef"
+    accept=".pdf"
+    required
+>
 
-    <br><br>
+<br><br>
 
-    <button type="submit">
-        Starta länkning
-    </button>
+<button type="submit">
+    Starta länkning
+</button>
 
 </form>
 
 </div>
-
 
 </body>
 </html>
@@ -188,6 +162,11 @@ button:hover{
 @app.route("/")
 def index():
     return HTML_PAGE
+
+
+@app.route("/health")
+def health():
+    return "OK", 200
 
 
 @app.route("/link", methods=["POST"])
@@ -220,13 +199,9 @@ def link():
     )
 
 
-@app.route("/health")
-def health():
-    return "OK", 200
-
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=8000,
-        debug=False,
+        debug=True
     )
