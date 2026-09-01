@@ -3,15 +3,18 @@ import re
 import csv
 import json
 import time
+import uuid
+import shutil
 import tempfile
 import difflib
 import logging
+import threading
 
 import fitz  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
 
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify, after_this_request
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dm-linker")
@@ -31,6 +34,29 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; DM-Linker/1.0)"}
 MATCH_THRESHOLD = 0.55   # difflib ratio 0-1 för att räkna som verifierad
 EDGE_SNAP_TOL = 20.0     # pt - hur nära sidkant en ruta ska ligga för att snäppas dit
 LOOKUP_CACHE: dict[str, tuple[str | None, str | None]] = {}  # artnr -> (url, name)
+
+# =========================
+# JOBB-STATUS (för progress-polling)
+# =========================
+# Body-analys är snabb, men uppslagningen mot jula.se tar en stund per
+# unikt artikelnummer. Render (och de flesta proxys) stänger anslutningen
+# om ett enda HTTP-anrop hänger för länge -> 502. Lösningen: starta
+# bearbetningen i en bakgrundstråd direkt, svara omedelbart med ett
+# job_id, och låt frontend polla /link/progress/<job_id> tills den är klar.
+
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _set_job(job_id: str, **kwargs):
+    with JOBS_LOCK:
+        JOBS[job_id].update(kwargs)
+
+
+def _get_job(job_id: str) -> dict | None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return dict(job) if job else None
 
 
 # =========================
@@ -180,32 +206,43 @@ def match_score(name_pdf: str, name_web: str) -> float:
     return difflib.SequenceMatcher(None, name_pdf.lower(), name_web.lower()).ratio()
 
 
-def resolve_candidates(candidates: list[dict]):
+def resolve_candidates(candidates: list[dict], progress_cb=None):
     """
-    Slår upp och verifierar varje unikt artikelnummer en gång, mappar
-    sedan tillbaka resultatet till varje ruta som refererar det numret.
+    Slår upp och verifierar varje UNIKT artikelnummer en gång (cache:as
+    inom denna körning), mappar sedan tillbaka resultatet till varje ruta
+    som refererar det numret. progress_cb(done, total) anropas efter varje
+    unikt uppslag, så anroparen kan visa procent.
     """
-    resolved = []
+    unique_artnrs = list(dict.fromkeys(c["artnr"] for c in candidates))
+    total = len(unique_artnrs)
+    per_artnr: dict[str, tuple[str | None, str | None]] = {}
+
     with requests.Session() as session:
-        for c in candidates:
-            url, name_web = lookup_jula(c["artnr"], session)
-            score = match_score(c["name_guess"], name_web) if name_web else 0.0
-            verified = bool(url and name_web and score >= MATCH_THRESHOLD)
+        for i, artnr in enumerate(unique_artnrs, start=1):
+            per_artnr[artnr] = lookup_jula(artnr, session)
+            if progress_cb:
+                progress_cb(i, total)
 
-            note = ""
-            if not url:
-                note = "Ingen exakt produktsida kunde hittas."
-            elif not verified:
-                note = f"Namn matchar inte tillräckligt bra ({score:.0%}) - granska manuellt."
+    resolved = []
+    for c in candidates:
+        url, name_web = per_artnr[c["artnr"]]
+        score = match_score(c["name_guess"], name_web) if name_web else 0.0
+        verified = bool(url and name_web and score >= MATCH_THRESHOLD)
 
-            resolved.append({
-                **c,
-                "url": url,
-                "name_web": name_web,
-                "match_score": round(score, 2),
-                "verified": verified,
-                "note": note,
-            })
+        note = ""
+        if not url:
+            note = "Ingen exakt produktsida kunde hittas."
+        elif not verified:
+            note = f"Namn matchar inte tillräckligt bra ({score:.0%}) - granska manuellt."
+
+        resolved.append({
+            **c,
+            "url": url,
+            "name_web": name_web,
+            "match_score": round(score, 2),
+            "verified": verified,
+            "note": note,
+        })
     return resolved
 
 
@@ -267,12 +304,12 @@ def write_qa_report(resolved: list[dict], out_path: str):
 # ORKESTRERING
 # =========================
 
-def process_pdf(input_pdf: str, out_dir: str):
+def process_pdf(input_pdf: str, out_dir: str, progress_cb=None):
     os.makedirs(out_dir, exist_ok=True)
 
     doc = fitz.open(input_pdf)
     candidates = extract_candidates(doc)
-    resolved = resolve_candidates(candidates)
+    resolved = resolve_candidates(candidates, progress_cb=progress_cb)
     linked_count = apply_links(doc, resolved)
 
     out_pdf = os.path.join(out_dir, "linked.pdf")
@@ -287,6 +324,31 @@ def process_pdf(input_pdf: str, out_dir: str):
 
     log.info(f"Klart: {linked_count} länkar skapade av {len(resolved)} kandidater.")
     return out_pdf, out_csv, out_qa, qa_report
+
+
+def run_job(job_id: str, input_pdf: str, out_dir: str):
+    """Körs i en bakgrundstråd. Uppdaterar JOBS med löpande status/procent."""
+    try:
+        _set_job(job_id, status="extracting", progress=0)
+
+        def on_progress(done, total):
+            pct = int(done / total * 100) if total else 100
+            _set_job(job_id, status="looking_up", progress=pct,
+                      progress_text=f"Slår upp produkt {done}/{total} på jula.se...")
+
+        out_pdf, out_csv, out_qa, qa_report = process_pdf(input_pdf, out_dir, progress_cb=on_progress)
+
+        _set_job(
+            job_id,
+            status="done",
+            progress=100,
+            progress_text="Klart!",
+            pdf_path=out_pdf,
+            qa_report=qa_report,
+        )
+    except Exception as e:
+        log.exception(f"Jobb {job_id} misslyckades")
+        _set_job(job_id, status="error", error=str(e))
 
 
 # =========================
@@ -304,21 +366,30 @@ body{font-family:Arial,sans-serif;background:#f5dce8;padding:40px;}
 .card{max-width:700px;margin:auto;background:white;padding:40px;border-radius:20px;}
 button{background:#ff4fa3;color:white;border:none;padding:15px 25px;border-radius:10px;cursor:pointer;font-size:1em;}
 button:disabled{background:#f5a9cf;cursor:not-allowed;}
-.spinner{
-    display:inline-block;
-    width:16px;height:16px;
-    border:3px solid #ffffff66;
-    border-top-color:#ffffff;
-    border-radius:50%;
-    animation:spin 0.8s linear infinite;
-    vertical-align:middle;
-    margin-right:8px;
-}
-@keyframes spin{to{transform:rotate(360deg);}}
 #status{margin-top:16px;font-size:0.95em;}
 #status.ok{color:#1a9c4a;}
 #status.error{color:#d92d2d;}
 #status.working{color:#555;}
+.progress-wrap{
+    margin-top:16px;
+    background:#f2f2f2;
+    border-radius:10px;
+    overflow:hidden;
+    height:22px;
+    display:none;
+}
+.progress-bar{
+    height:100%;
+    width:0%;
+    background:#ff4fa3;
+    transition:width 0.3s ease;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    color:white;
+    font-size:0.8em;
+    font-weight:bold;
+}
 </style>
 </head>
 <body>
@@ -329,6 +400,11 @@ button:disabled{background:#f5a9cf;cursor:not-allowed;}
 <br><br>
 <button type="submit" id="submitBtn">Starta länkning</button>
 </form>
+
+<div class="progress-wrap" id="progressWrap">
+  <div class="progress-bar" id="progressBar">0%</div>
+</div>
+
 <p id="status" style="color:#888;font-size:0.9em;">
 Resultatet laddas ner som en färdiglänkad PDF.
 </p>
@@ -339,37 +415,62 @@ const form = document.getElementById("linkForm");
 const btn = document.getElementById("submitBtn");
 const status = document.getElementById("status");
 const fileInput = document.getElementById("pdfInput");
+const progressWrap = document.getElementById("progressWrap");
+const progressBar = document.getElementById("progressBar");
+
+function setProgress(pct, text) {
+    progressWrap.style.display = "block";
+    progressBar.style.width = pct + "%";
+    progressBar.textContent = pct + "%";
+    if (text) {
+        status.className = "working";
+        status.textContent = text;
+    }
+}
+
+async function pollProgress(jobId) {
+    while (true) {
+        const resp = await fetch(`/link/progress/${jobId}`);
+        if (!resp.ok) throw new Error("Kunde inte hämta status (" + resp.status + ")");
+        const data = await resp.json();
+
+        if (data.status === "error") {
+            throw new Error(data.error || "Okänt fel under bearbetning");
+        }
+
+        setProgress(data.progress || 0, data.progress_text || "Bearbetar...");
+
+        if (data.status === "done") {
+            return;
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+    }
+}
 
 form.addEventListener("submit", async (e) => {
     e.preventDefault();
-
     if (!fileInput.files.length) return;
 
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Länkar PDF...';
-    status.className = "working";
-    status.textContent = "Bearbetar - detta kan ta en stund beroende på hur många produkter DM:en innehåller...";
+    btn.textContent = "Länkar PDF...";
+    setProgress(0, "Laddar upp och analyserar PDF...");
 
     const formData = new FormData();
     formData.append("pdf", fileInput.files[0]);
 
     try {
-        const resp = await fetch("/link", { method: "POST", body: formData });
-
-        if (!resp.ok) {
-            const text = await resp.text();
-            throw new Error(text || ("Serverfel (" + resp.status + ")"));
+        const startResp = await fetch("/link/start", { method: "POST", body: formData });
+        if (!startResp.ok) {
+            const text = await startResp.text();
+            throw new Error(text || ("Serverfel (" + startResp.status + ")"));
         }
+        const { job_id } = await startResp.json();
 
-        const blob = await resp.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "linked.pdf";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.URL.revokeObjectURL(url);
+        await pollProgress(job_id);
+
+        // ladda ner PDF:en
+        window.location = `/link/download/${job_id}`;
 
         status.className = "ok";
         status.textContent = "Klart! Den länkade PDF:en har laddats ner.";
@@ -401,35 +502,70 @@ def health():
     return "OK"
 
 
-@app.route("/link", methods=["POST"])
-def link():
+@app.route("/link/start", methods=["POST"])
+def link_start():
     if "pdf" not in request.files:
         return "Ingen PDF uppladdad", 400
 
     uploaded_pdf = request.files["pdf"]
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            src_path = os.path.join(tmp, "input.pdf")
-            uploaded_pdf.save(src_path)
+    job_id = uuid.uuid4().hex
+    job_dir = os.path.join(tempfile.gettempdir(), "dm-linker", job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-            out_dir = os.path.join(tmp, "out")
-            out_pdf, out_csv, out_qa, qa_report = process_pdf(src_path, out_dir)
+    src_path = os.path.join(job_dir, "input.pdf")
+    uploaded_pdf.save(src_path)
 
-            # CSV och QA-rapport skrivs fortfarande ut i loggen så du kan
-            # se vad som hände, men skickas inte till användaren - de vill
-            # bara ha PDF:en tillbaka.
-            log.info(f"QA: {qa_report['antal_lankar_skapade']}/{qa_report['antal_produkter_hittade']} länkade.")
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "queued",
+            "progress": 0,
+            "progress_text": "I kö...",
+            "job_dir": job_dir,
+        }
 
-            with open(out_pdf, "rb") as f:
-                data = f.read()
-    except Exception as e:
-        log.exception("Fel vid länkning av PDF")
-        return f"Kunde inte länka PDF:en: {e}", 500
+    out_dir = os.path.join(job_dir, "out")
+    thread = threading.Thread(target=run_job, args=(job_id, src_path, out_dir), daemon=True)
+    thread.start()
 
-    from io import BytesIO
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/link/progress/<job_id>")
+def link_progress(job_id):
+    job = _get_job(job_id)
+    if not job:
+        return jsonify({"status": "error", "error": "Okänt job_id"}), 404
+
+    return jsonify({
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "progress_text": job.get("progress_text", ""),
+        "error": job.get("error"),
+    })
+
+
+@app.route("/link/download/<job_id>")
+def link_download(job_id):
+    job = _get_job(job_id)
+    if not job:
+        return "Okänt job_id", 404
+    if job.get("status") != "done" or not job.get("pdf_path"):
+        return "Jobbet är inte klart än", 409
+
+    pdf_path = job["pdf_path"]
+
+    @after_this_request
+    def _cleanup(response):
+        job_dir = job.get("job_dir")
+        if job_dir and os.path.isdir(job_dir):
+            shutil.rmtree(job_dir, ignore_errors=True)
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        return response
+
     return send_file(
-        BytesIO(data),
+        pdf_path,
         as_attachment=True,
         download_name="linked.pdf",
         mimetype="application/pdf",
@@ -446,3 +582,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 8000)),
         debug=True,
     )
+
