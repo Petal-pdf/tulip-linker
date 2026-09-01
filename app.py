@@ -164,24 +164,21 @@ button:hover{
 
 <h1>💗 DM Linker</h1>
 
-<input
-    type="file"
-    name="pdf"
-    accept=".pdf"
-    required
->
+<form method="post" action="/link" enctype="  name="pdf"
+        accept=".pdf"
+        required
+    >
 
-<br><br>
+    <br><br>
 
-<button type="submit">
-    Starta länkning
-</button>
-
-</form>
+    <button type="submit">
+        Starta länkning
+    </button>
 
 </form>
 
 </div>
+
 
 </body>
 </html>
