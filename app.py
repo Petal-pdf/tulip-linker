@@ -1,7 +1,7 @@
 import os
 import tempfile
-
 import fitz
+
 from flask import Flask, request, send_file
 
 app = Flask(__name__)
@@ -10,7 +10,7 @@ app = Flask(__name__)
 def process_pdf(input_path, output_path):
     doc = fitz.open(input_path)
 
-    # Test: lägg bara till en sparad PDF
+    # Test: sparar bara om PDF:en
     doc.save(output_path)
 
     doc.close()
@@ -50,17 +50,15 @@ button{
     font-size:16px;
 }
 </style>
-
 </head>
+
 <body>
 
 <div class="card">
 
 <h1>DM Linker</h1>
 
-/link
-
-<input
+<form actiont
     type="file"
     name="pdf"
     accept=".pdf"
@@ -129,3 +127,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000))
     )
+``
