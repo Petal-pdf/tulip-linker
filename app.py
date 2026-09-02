@@ -222,21 +222,93 @@ def match_score(name_pdf: str, name_web: str) -> float:
     return difflib.SequenceMatcher(None, name_pdf.lower(), name_web.lower()).ratio()
 
 
-def resolve_candidates(candidates: list[dict], page, progress_cb=None):
+def resolve_candidates(candidates: list[dict], browser, progress_cb=None):
     """
     Slår upp och verifierar varje UNIKT artikelnummer en gång (cache:as
     inom denna körning), mappar sedan tillbaka resultatet till varje ruta
     som refererar det numret. progress_cb(done, total) anropas efter varje
     unikt uppslag, så anroparen kan visa procent.
+
+    VIKTIGT (tillförlitlighet): all trafik i jobbet delar EN
+    webbläsarkontext (cookies/session bevaras mellan uppslag), med en
+    normal, icke-bot-liknande fingeravtryck (riktig user agent, viewport,
+    språk). browser.new_page() utan egen kontext skapar annars en helt
+    ny, tom session VARJE gång - sajten ser då ett hundratal "nya
+    besökare" på några minuter, vilket är precis vad rate limiting/
+    bot-skydd letar efter. Vi lägger också in en kort artighetspaus
+    mellan varje uppslag, och en längre "kylpaus" om vi ser flera
+    timeouts i rad (tecken på att vi blivit tillfälligt strypta).
     """
     unique_artnrs = list(dict.fromkeys(c["artnr"] for c in candidates))
     total = len(unique_artnrs)
     per_artnr: dict[str, tuple[str | None, str | None]] = {}
 
+    RECYCLE_EVERY = 15
+    POLITE_DELAY = 1.2          # sekunder mellan varje uppslag
+    COOLDOWN_AFTER_FAILS = 3     # såhär många misslyckade uppslag i rad...
+    COOLDOWN_SECONDS = 30        # ...ger en extra paus på detta innan vi fortsätter
+
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        locale="sv-SE",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        extra_http_headers={"Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7"},
+    )
+    # Döljer det tydligaste automations-fingeravtrycket (navigator.webdriver)
+    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    def _new_page():
+        p = context.new_page()
+        # Vi bryr oss bara om HTML/länkar, inte hur sidan ser ut - blockera
+        # bilder/typsnitt/media så vi slipper ladda ner och rendera dem.
+        p.route(
+            re.compile(r"\.(png|jpg|jpeg|gif|webp|svg|woff2?|ttf|mp4|mp3)(\?.*)?$", re.I),
+            lambda route: route.abort(),
+        )
+        return p
+
+    page = _new_page()
+    consecutive_fails = 0
+
     for i, artnr in enumerate(unique_artnrs, start=1):
-        per_artnr[artnr] = lookup_jula(artnr, page)
+        url, name_web = lookup_jula(artnr, page)
+        per_artnr[artnr] = (url, name_web)
+
+        if url is None:
+            consecutive_fails += 1
+        else:
+            consecutive_fails = 0
+
         if progress_cb:
             progress_cb(i, total)
+
+        if consecutive_fails >= COOLDOWN_AFTER_FAILS:
+            log.warning(
+                f"{consecutive_fails} misslyckade uppslag i rad - pausar "
+                f"{COOLDOWN_SECONDS}s (troligen tillfällig strypning från jula.se)."
+            )
+            if progress_cb:
+                progress_cb(i, total)  # håller UI:t vid liv under pausen
+            time.sleep(COOLDOWN_SECONDS)
+            consecutive_fails = 0
+        else:
+            time.sleep(POLITE_DELAY)
+
+        if i % RECYCLE_EVERY == 0 and i < total:
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = _new_page()
+
+    try:
+        page.close()
+        context.close()
+    except Exception:
+        pass
 
     resolved = []
     for c in candidates:
@@ -319,12 +391,12 @@ def write_qa_report(resolved: list[dict], out_path: str):
 # ORKESTRERING
 # =========================
 
-def process_pdf(input_pdf: str, out_dir: str, page, progress_cb=None):
+def process_pdf(input_pdf: str, out_dir: str, browser, progress_cb=None):
     os.makedirs(out_dir, exist_ok=True)
 
     doc = fitz.open(input_pdf)
     candidates = extract_candidates(doc)
-    resolved = resolve_candidates(candidates, page, progress_cb=progress_cb)
+    resolved = resolve_candidates(candidates, browser, progress_cb=progress_cb)
     linked_count = apply_links(doc, resolved)
 
     out_pdf = os.path.join(out_dir, "linked.pdf")
@@ -357,11 +429,17 @@ def run_job(job_id: str, input_pdf: str, out_dir: str):
                       progress_text=f"Slår upp produkt {done}/{total} på jula.se...")
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-            browser_page = browser.new_page()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",   # /dev/shm är ofta litet i containrar -> krascher annars
+                    "--disable-gpu",
+                ],
+            )
             try:
                 out_pdf, out_csv, out_qa, qa_report = process_pdf(
-                    input_pdf, out_dir, browser_page, progress_cb=on_progress
+                    input_pdf, out_dir, browser, progress_cb=on_progress
                 )
             finally:
                 browser.close()
