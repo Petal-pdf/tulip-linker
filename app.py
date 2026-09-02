@@ -150,7 +150,7 @@ def extract_candidates(doc: fitz.Document):
 # STEG 2: SLÅ UPP + VERIFIERA PÅ JULA.SE
 # =========================
 
-def lookup_jula(artnr: str, page, retries: int = 2):
+def lookup_jula(artnr: str, page, retries: int = 1):
     """
     Slår upp artikelnumret via jula.se:s sök med en riktig (headless)
     webbläsare, eftersom jula.se renderar sökresultat med JavaScript -
@@ -158,20 +158,35 @@ def lookup_jula(artnr: str, page, retries: int = 2):
 
     Hittar produktsidans URL (aldrig söksidan själv - regel 5) och läser
     produktnamnet från produktsidan för verifiering.
+
+    VIKTIGT (prestanda): vi väntar INTE på "networkidle". Många sajter
+    (jula.se inkluderat) har ständig bakgrundstrafik (analytics m.m.) som
+    gör att "networkidle" aldrig inträffar - Playwright hänger då kvar
+    till hela timeouten löper ut, VARJE sidladdning. Med 100+ produkter
+    blir det evighetslångt. Istället: vänta bara på att DOM:en är laddad
+    ("domcontentloaded", snabbt), och ge sedan React/Next.js en kort,
+    begränsad chans att hydrera klart via ett kort networkidle-försök
+    som vi avbryter tidigt om det inte händer.
     """
     if artnr in LOOKUP_CACHE:
         return LOOKUP_CACHE[artnr]
 
     result = (None, None)
 
+    def _settle():
+        # Ge sidan max ~2s extra för att bli klar - annars kör vidare ändå.
+        try:
+            page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception:
+            pass
+
     for attempt in range(retries + 1):
         try:
-            page.goto(JULA_SEARCH_URL.format(query=artnr), wait_until="networkidle", timeout=20000)
-            page.wait_for_timeout(400)  # liten extra marginal för sen hydrering
+            page.goto(JULA_SEARCH_URL.format(query=artnr), wait_until="domcontentloaded", timeout=10000)
+            _settle()
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
         except Exception as e:
             log.warning(f"[{artnr}] söksidan misslyckades ({attempt + 1}/{retries + 1}): {e}")
-            time.sleep(1.0)
             continue
 
         candidate_links = [
@@ -179,20 +194,23 @@ def lookup_jula(artnr: str, page, retries: int = 2):
             if f"-{artnr}/" in h or h.rstrip("/").endswith(artnr)
         ]
 
-        if candidate_links:
-            url = candidate_links[0]
-            try:
-                page.goto(url, wait_until="networkidle", timeout=20000)
-                content = page.content()
-                if artnr in content:
-                    h1 = page.locator("h1").first
-                    name_web = h1.inner_text().strip() if h1.count() else None
-                    result = (url, name_web)
-                    break
-            except Exception as e:
-                log.warning(f"[{artnr}] kunde inte läsa produktsidan: {e}")
+        if not candidate_links:
+            # Genuint inget resultat - inget värt att gå i loop om igen.
+            break
 
-        time.sleep(0.5)
+        url = candidate_links[0]
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=10000)
+            _settle()
+            content = page.content()
+            if artnr in content:
+                h1 = page.locator("h1").first
+                name_web = h1.inner_text().strip() if h1.count() else None
+                result = (url, name_web)
+        except Exception as e:
+            log.warning(f"[{artnr}] kunde inte läsa produktsidan: {e}")
+
+        break  # antingen lyckades det, eller så var det ett riktigt fel - försök inte igen
 
     LOOKUP_CACHE[artnr] = result
     return result
