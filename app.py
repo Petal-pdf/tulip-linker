@@ -11,7 +11,6 @@ import logging
 import threading
 
 import fitz  # PyMuPDF
-import requests  # kvar ifall du vill lägga tillbaka enkel HTTP-verifiering senare
 from playwright.sync_api import sync_playwright
 
 from flask import Flask, request, send_file, jsonify, after_this_request
